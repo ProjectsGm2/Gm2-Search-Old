@@ -334,48 +334,274 @@ function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
  *
  * @return string Normalized sort token or empty string when no explicit sort is detected.
  */
+function woo_search_opt_normalize_orderby_token( $value ) {
+    if ( ! is_string( $value ) ) {
+        return '';
+    }
+
+    $value = strtolower( trim( $value ) );
+
+    if ( '' === $value ) {
+        return '';
+    }
+
+    $value = str_replace( array( '-', '.' ), '_', $value );
+
+    return $value;
+}
+
+/**
+ * Normalize ORDER direction tokens to `asc`/`desc`.
+ *
+ * @param mixed $value Incoming value.
+ *
+ * @return string
+ */
+function woo_search_opt_normalize_order_direction( $value ) {
+    if ( ! is_string( $value ) ) {
+        return '';
+    }
+
+    $value = strtolower( trim( $value ) );
+
+    return in_array( $value, array( 'asc', 'desc' ), true ) ? $value : '';
+}
+
+/**
+ * Append a normalized ORDER BY token to the collection ensuring uniqueness and first-position tracking.
+ *
+ * @param array  $tokens          Reference to the token collection.
+ * @param string $token           Token to append.
+ * @param string $primary_orderby Reference to the primary token holder.
+ *
+ * @return void
+ */
+function woo_search_opt_add_orderby_token( array &$tokens, $token, &$primary_orderby ) {
+    if ( '' === $token ) {
+        return;
+    }
+
+    if ( ! in_array( $token, $tokens, true ) ) {
+        $tokens[] = $token;
+    }
+
+    if ( '' === $primary_orderby ) {
+        $primary_orderby = $token;
+    }
+}
+
+/**
+ * Normalize incoming WooCommerce sort requests to a concise internal token.
+ *
+ * @param WP_Query $wp_query Query instance under inspection.
+ *
+ * @return string Normalized sort token or empty string when no explicit sort is detected.
+ */
 function woo_search_opt_detect_sort( $wp_query ) {
     if ( ! ( $wp_query instanceof WP_Query ) ) {
         return '';
     }
 
-    $orderby_value = $wp_query->get( 'orderby' );
-    if ( is_array( $orderby_value ) ) {
-        $orderby_value = reset( $orderby_value );
+    if ( isset( $wp_query->query_vars['woo_search_opt_resolved_sort'] ) ) {
+        $cached = $wp_query->query_vars['woo_search_opt_resolved_sort'];
+        return is_string( $cached ) ? $cached : '';
     }
-    $orderby_value = is_string( $orderby_value ) ? strtolower( trim( $orderby_value ) ) : '';
-    if ( '' !== $orderby_value ) {
-        $orderby_value = str_replace( '-', '_', $orderby_value );
-        $orderby_value_parts = preg_split( '/\s+/', $orderby_value );
-        if ( is_array( $orderby_value_parts ) && ! empty( $orderby_value_parts ) ) {
-            $orderby_value = $orderby_value_parts[0];
+
+    $orderby_raw = $wp_query->get( 'orderby' );
+    $meta_key    = $wp_query->get( 'meta_key' );
+    $order_raw   = $wp_query->get( 'order' );
+
+    $meta_key_lower   = is_string( $meta_key ) ? strtolower( trim( $meta_key ) ) : '';
+    $normalized_tokens = array();
+    $primary_orderby   = '';
+    $derived_order     = woo_search_opt_normalize_order_direction( $order_raw );
+
+    if ( is_array( $orderby_raw ) ) {
+        foreach ( $orderby_raw as $key => $value ) {
+            if ( is_string( $key ) ) {
+                $token = woo_search_opt_normalize_orderby_token( $key );
+                if ( '' !== $token ) {
+                    woo_search_opt_add_orderby_token( $normalized_tokens, $token, $primary_orderby );
+                }
+            }
+
+            if ( is_string( $value ) ) {
+                $direction = woo_search_opt_normalize_order_direction( $value );
+                if ( '' === $derived_order && '' !== $direction ) {
+                    $derived_order = $direction;
+                }
+
+                if ( '' === $direction ) {
+                    $token = woo_search_opt_normalize_orderby_token( $value );
+                    if ( '' !== $token ) {
+                        woo_search_opt_add_orderby_token( $normalized_tokens, $token, $primary_orderby );
+                    }
+                }
+            }
+        }
+    } elseif ( is_string( $orderby_raw ) ) {
+        $orderby_string = strtolower( trim( $orderby_raw ) );
+
+        if ( '' !== $orderby_string ) {
+            $orderby_string = str_replace( array( '-', ',' ), ' ', $orderby_string );
+            $orderby_string = str_replace( '.', '_', $orderby_string );
+            $parts          = preg_split( '/\s+/', $orderby_string );
+
+            if ( is_array( $parts ) ) {
+                foreach ( $parts as $part ) {
+                    $token = woo_search_opt_normalize_orderby_token( $part );
+                    if ( '' === $token ) {
+                        continue;
+                    }
+
+                    if ( in_array( $token, array( 'asc', 'desc' ), true ) ) {
+                        if ( '' === $derived_order ) {
+                            $derived_order = $token;
+                        }
+                        continue;
+                    }
+
+                    if ( '' !== $token ) {
+                        woo_search_opt_add_orderby_token( $normalized_tokens, $token, $primary_orderby );
+                    }
+                }
+            }
         }
     }
 
-    $order_value = $wp_query->get( 'order' );
-    $order_value = is_string( $order_value ) ? strtolower( trim( $order_value ) ) : '';
+    $normalized_tokens = array_values( array_filter( $normalized_tokens ) );
 
-    $normalized = '';
+    $resolved = '';
 
-    switch ( $orderby_value ) {
-        case 'price':
-            $normalized = ( 'desc' === $order_value ) ? 'price_desc' : 'price';
-            break;
-        case 'price_desc':
-            $normalized = 'price_desc';
-            break;
-        case 'price_asc':
-            $normalized = 'price';
-            break;
-        case 'popularity':
-        case 'rating':
-        case 'date':
-        case 'menu_order':
-            $normalized = $orderby_value;
-            break;
+    if ( in_array( 'price_desc', $normalized_tokens, true ) ) {
+        $resolved      = 'price_desc';
+        $derived_order = ( '' === $derived_order ) ? 'desc' : $derived_order;
+    } elseif ( in_array( 'price_asc', $normalized_tokens, true ) ) {
+        $resolved      = 'price';
+        $derived_order = ( '' === $derived_order ) ? 'asc' : $derived_order;
+    } elseif ( in_array( 'price', $normalized_tokens, true ) ) {
+        $resolved      = ( 'desc' === $derived_order ) ? 'price_desc' : 'price';
+        $derived_order = ( '' === $derived_order ) ? 'asc' : $derived_order;
     }
 
-    return $normalized;
+    if ( '' === $resolved && in_array( 'popularity', $normalized_tokens, true ) ) {
+        $resolved = 'popularity';
+    }
+
+    if ( '' === $resolved && in_array( 'rating', $normalized_tokens, true ) ) {
+        $resolved      = 'rating';
+        $derived_order = ( '' === $derived_order ) ? 'desc' : $derived_order;
+    }
+
+    if ( '' === $resolved && ( in_array( 'post_date', $normalized_tokens, true ) || in_array( 'date', $normalized_tokens, true ) ) ) {
+        $resolved = 'date';
+    }
+
+    if ( '' === $resolved && in_array( 'menu_order', $normalized_tokens, true ) ) {
+        $resolved = 'menu_order';
+    }
+
+    if ( '' === $resolved && '_price' === $meta_key_lower && ( in_array( 'meta_value_num', $normalized_tokens, true ) || in_array( 'meta_value', $normalized_tokens, true ) ) ) {
+        $resolved      = ( 'desc' === $derived_order ) ? 'price_desc' : 'price';
+        $derived_order = ( '' === $derived_order ) ? 'asc' : $derived_order;
+    }
+
+    if ( '' === $resolved && '_wc_average_rating' === $meta_key_lower && ( in_array( 'meta_value_num', $normalized_tokens, true ) || in_array( 'meta_value', $normalized_tokens, true ) || in_array( 'rating', $normalized_tokens, true ) ) ) {
+        $resolved      = 'rating';
+        $derived_order = ( '' === $derived_order ) ? 'desc' : $derived_order;
+    }
+
+    if ( '' === $resolved && 'total_sales' === $meta_key_lower && in_array( 'meta_value_num', $normalized_tokens, true ) ) {
+        $resolved      = 'popularity';
+        $derived_order = ( '' === $derived_order ) ? 'desc' : $derived_order;
+    }
+
+    $wp_query->query_vars['woo_search_opt_resolved_sort'] = $resolved;
+    $wp_query->query_vars['woo_search_opt_sort_details']   = array(
+        'orderby'           => $orderby_raw,
+        'meta_key'          => $meta_key,
+        'order'             => $order_raw,
+        'primary_orderby'   => $primary_orderby,
+        'derived_order'     => $derived_order,
+        'normalized_tokens' => $normalized_tokens,
+    );
+
+    return $resolved;
+}
+
+/**
+ * Collect the resolved sort token and raw orderby data for diagnostics.
+ *
+ * @param WP_Query $wp_query Query instance.
+ *
+ * @return array
+ */
+function woo_search_opt_collect_sort_diagnostics( $wp_query ) {
+    $defaults = array(
+        'token'            => '',
+        'orderby_raw'      => '',
+        'meta_key_raw'     => '',
+        'order_raw'        => '',
+        'primary_orderby'  => '',
+        'derived_order'    => '',
+        'normalized_tokens'=> array(),
+    );
+
+    if ( ! ( $wp_query instanceof WP_Query ) ) {
+        return $defaults;
+    }
+
+    $token = woo_search_opt_detect_sort( $wp_query );
+
+    $details = array();
+    if ( isset( $wp_query->query_vars['woo_search_opt_sort_details'] ) && is_array( $wp_query->query_vars['woo_search_opt_sort_details'] ) ) {
+        $details = $wp_query->query_vars['woo_search_opt_sort_details'];
+    }
+
+    $normalized_tokens = array();
+    if ( isset( $details['normalized_tokens'] ) && is_array( $details['normalized_tokens'] ) ) {
+        $normalized_tokens = array_values( array_unique( array_filter( $details['normalized_tokens'] ) ) );
+    }
+
+    return array(
+        'token'             => $token,
+        'orderby_raw'       => array_key_exists( 'orderby', $details ) ? $details['orderby'] : $wp_query->get( 'orderby' ),
+        'meta_key_raw'      => array_key_exists( 'meta_key', $details ) ? $details['meta_key'] : $wp_query->get( 'meta_key' ),
+        'order_raw'         => array_key_exists( 'order', $details ) ? $details['order'] : $wp_query->get( 'order' ),
+        'primary_orderby'   => isset( $details['primary_orderby'] ) ? $details['primary_orderby'] : '',
+        'derived_order'     => isset( $details['derived_order'] ) ? $details['derived_order'] : '',
+        'normalized_tokens' => $normalized_tokens,
+    );
+}
+
+/**
+ * Enrich a logging context array with sort diagnostics.
+ *
+ * @param array    $context          Context array.
+ * @param WP_Query $wp_query         Query instance.
+ * @param array    $sort_diagnostics Optional precomputed diagnostics.
+ *
+ * @return array
+ */
+function woo_search_opt_append_sort_context( array $context, $wp_query, $sort_diagnostics = null ) {
+    if ( ! ( $wp_query instanceof WP_Query ) ) {
+        $context['resolved_sort'] = '';
+        return $context;
+    }
+
+    if ( null === $sort_diagnostics ) {
+        $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    }
+
+    $context['resolved_sort']       = woo_search_opt_sanitize_scalar_for_logging( $sort_diagnostics['token'] );
+    $context['sort_orderby_raw']    = woo_search_opt_normalize_context_value( $sort_diagnostics['orderby_raw'] );
+    $context['sort_meta_key_raw']   = woo_search_opt_sanitize_scalar_for_logging( $sort_diagnostics['meta_key_raw'] );
+    $context['sort_order_raw']      = woo_search_opt_sanitize_scalar_for_logging( $sort_diagnostics['order_raw'] );
+    $context['sort_primary_orderby']= woo_search_opt_sanitize_scalar_for_logging( $sort_diagnostics['primary_orderby'] );
+    $context['sort_derived_order']  = woo_search_opt_sanitize_scalar_for_logging( $sort_diagnostics['derived_order'] );
+    $context['sort_tokens']         = woo_search_opt_normalize_context_value( $sort_diagnostics['normalized_tokens'] );
+
+    return $context;
 }
 
 /**
@@ -479,7 +705,7 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
         $is_standard_wp_ajax = function_exists( 'wp_doing_ajax' ) && wp_doing_ajax();
         $resolved_search       = woo_search_opt_resolve_search_phrase( $query );
         $resolved_search_safe  = woo_search_opt_sanitize_scalar_for_logging( $resolved_search );
-        $resolved_sort         = woo_search_opt_detect_sort( $query );
+        $sort_diagnostics      = woo_search_opt_collect_sort_diagnostics( $query );
         $request_action        = isset( $_REQUEST['action'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['action'] ) ) : '';
         $search_term_injected  = false;
 
@@ -501,9 +727,10 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
             'elementor_ajax_input' => $is_elementor_ajax,
             'wp_ajax'              => $is_standard_wp_ajax,
             'resolved_search'      => $resolved_search_safe,
-            'resolved_sort'        => woo_search_opt_sanitize_scalar_for_logging( $resolved_sort ),
             'search_term_injected' => $search_term_injected,
         );
+
+        $context = woo_search_opt_append_sort_context( $context, $query, $sort_diagnostics );
 
         if ( $is_admin_request && ! ( $is_standard_wp_ajax || $is_elementor_ajax ) ) {
             $context['decision'] = 'bail_admin_request';
@@ -556,21 +783,39 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
 add_action( 'pre_get_posts', 'woo_search_opt_log_query', 19, 1 );
 
 /**
+ * Check whether the JOIN clause already contains an alias.
+ *
+ * @param string $join_sql JOIN clause.
+ * @param string $alias    Alias to detect.
+ *
+ * @return bool
+ */
+function woo_search_opt_join_contains_alias( $join_sql, $alias ) {
+    if ( ! is_string( $join_sql ) || '' === $join_sql || '' === $alias ) {
+        return false;
+    }
+
+    return (bool) preg_match( '/\b' . preg_quote( $alias, '/' ) . '\b/i', $join_sql );
+}
+
+/**
  * Add JOINs for _price, _sku, and aggregated product attributes.
  * Unique alias names are used to avoid conflicts.
  */
 function woo_search_opt_joins( $join, $wp_query ) {
     global $wpdb;
 
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $sort_token       = $sort_diagnostics['token'];
     if ( '' === $search_phrase ) {
-        woo_search_opt_log( 'woo_search_opt posts_join bail', array(
+        $context = array(
             'reason'          => 'empty_search',
             'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
             'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
-            'resolved_sort'   => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
-        ) );
+        );
+        $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+        woo_search_opt_log( 'woo_search_opt posts_join bail', $context );
         return $join;
     }
 
@@ -578,12 +823,13 @@ function woo_search_opt_joins( $join, $wp_query ) {
     $post_types = $wp_query->get('post_type');
     if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
          (!is_array($post_types) && 'product' !== $post_types) ) {
-        woo_search_opt_log( 'woo_search_opt posts_join bail', array(
+        $context = array(
             'reason'     => 'non_product_query',
             'flags'      => woo_search_opt_extract_query_flags( $wp_query ),
             'post_types' => woo_search_opt_normalize_context_value( $post_types ),
-            'resolved_sort' => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
-        ) );
+        );
+        $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+        woo_search_opt_log( 'woo_search_opt posts_join bail', $context );
         return $join;
     }
 
@@ -591,17 +837,17 @@ function woo_search_opt_joins( $join, $wp_query ) {
     $added_joins  = array();
 
     // Join postmeta for price and SKU.
-    if ( false === strpos( $join, 'woo_pm_price' ) ) {
+    if ( ! woo_search_opt_join_contains_alias( $join, 'woo_pm_price' ) ) {
         $join        .= " LEFT JOIN {$wpdb->postmeta} AS woo_pm_price ON ({$wpdb->posts}.ID = woo_pm_price.post_id AND woo_pm_price.meta_key = '_price') ";
         $added_joins[] = 'woo_pm_price';
     }
-    if ( false === strpos( $join, 'woo_pm_sku' ) ) {
+    if ( ! woo_search_opt_join_contains_alias( $join, 'woo_pm_sku' ) ) {
         $join        .= " LEFT JOIN {$wpdb->postmeta} AS woo_pm_sku ON ({$wpdb->posts}.ID = woo_pm_sku.post_id AND woo_pm_sku.meta_key = '_sku') ";
         $added_joins[] = 'woo_pm_sku';
     }
 
     // Join a subquery to aggregate attribute names (from taxonomies starting with 'pa_').
-    if ( false === strpos( $join, 'woo_attr' ) ) {
+    if ( ! woo_search_opt_join_contains_alias( $join, 'woo_attr' ) ) {
         $join        .= " LEFT JOIN (
                 SELECT tr.object_id, GROUP_CONCAT(t.name SEPARATOR ' ') AS attributes
                 FROM {$wpdb->term_relationships} tr
@@ -613,25 +859,27 @@ function woo_search_opt_joins( $join, $wp_query ) {
         $added_joins[] = 'woo_attr';
     }
 
-    if ( 'popularity' === $sort_token && false === strpos( $join, 'woo_pm_total_sales' ) ) {
+    if ( 'popularity' === $sort_token && ! woo_search_opt_join_contains_alias( $join, 'woo_pm_total_sales' ) ) {
         $join        .= " LEFT JOIN {$wpdb->postmeta} AS woo_pm_total_sales ON ({$wpdb->posts}.ID = woo_pm_total_sales.post_id AND woo_pm_total_sales.meta_key = 'total_sales') ";
         $added_joins[] = 'woo_pm_total_sales';
     }
 
-    if ( 'rating' === $sort_token && false === strpos( $join, 'woo_pm_rating' ) ) {
+    if ( 'rating' === $sort_token && ! woo_search_opt_join_contains_alias( $join, 'woo_pm_rating' ) ) {
         $join        .= " LEFT JOIN {$wpdb->postmeta} AS woo_pm_rating ON ({$wpdb->posts}.ID = woo_pm_rating.post_id AND woo_pm_rating.meta_key = '_wc_average_rating') ";
         $added_joins[] = 'woo_pm_rating';
     }
 
-    woo_search_opt_log( 'woo_search_opt posts_join applied', array(
+    $context = array(
         'flags'          => woo_search_opt_extract_query_flags( $wp_query ),
         'search_term'    => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_join'  => $initial_join,
         'outgoing_join'  => woo_search_opt_truncate_for_logging( $join ),
         'attribute_join' => 'pa_% taxonomy aggregation',
-        'resolved_sort'  => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
         'sort_joins'     => woo_search_opt_sanitize_array_for_logging( $added_joins ),
-    ) );
+    );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+
+    woo_search_opt_log( 'woo_search_opt posts_join applied', $context );
 
     return $join;
 }
@@ -644,16 +892,17 @@ add_filter('posts_join', 'woo_search_opt_joins', 20, 2);
 function woo_search_opt_posts_search( $search, $wp_query ) {
     global $wpdb;
 
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $sort_token       = $sort_diagnostics['token'];
     $context = array(
         'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
         'incoming_search' => woo_search_opt_truncate_for_logging( $search ),
         'search_phrase'   => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'        => 'pending',
-        'resolved_sort'   => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
     );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
         $context['decision'] = 'bail_empty_search';
         woo_search_opt_log( 'woo_search_opt posts_search bail', $context );
@@ -663,7 +912,7 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
     // Only affect product queries.
     $post_types = $wp_query->get('post_type');
     if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
-         (!is_array($post_types) && 'product' !== $post_types) ) {
+        (!is_array($post_types) && 'product' !== $post_types) ) {
         $context['decision']   = 'bail_non_product_query';
         $context['post_types'] = woo_search_opt_normalize_context_value( $post_types );
         woo_search_opt_log( 'woo_search_opt posts_search bail', $context );
@@ -739,16 +988,17 @@ add_filter('posts_search', 'woo_search_opt_posts_search', 20, 2);
 function woo_search_opt_relevance( $fields, $wp_query ) {
     global $wpdb;
 
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $sort_token       = $sort_diagnostics['token'];
     $context = array(
         'flags'          => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'  => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_field' => woo_search_opt_truncate_for_logging( $fields ),
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'       => 'pending',
-        'resolved_sort'  => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
     );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
         $context['decision'] = 'bail_empty_search';
         woo_search_opt_log( 'woo_search_opt posts_fields bail', $context );
@@ -897,16 +1147,17 @@ add_filter('posts_fields', 'woo_search_opt_relevance', 20, 2);
 function woo_search_opt_orderby( $orderby, $wp_query ) {
     global $wpdb;
 
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $sort_token       = $sort_diagnostics['token'];
     $context = array(
         'flags'             => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'     => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_orderby'  => woo_search_opt_truncate_for_logging( $orderby ),
         'resolved_search'   => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'          => 'pending',
-        'resolved_sort'     => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
     );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
         $context['decision'] = 'bail_empty_search';
         woo_search_opt_log( 'woo_search_opt posts_orderby bail', $context );
@@ -951,9 +1202,9 @@ add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
 
 /*
  * Manual test checklist:
- * - Search for a product keyword and confirm the default relevance ordering remains unchanged.
- * - Switch the WooCommerce sort dropdown to popularity, rating, latest, and price (low/high) and verify the logs and UI honor each sort.
- * - Repeat the sort dropdown on a non-search catalog page to ensure it behaves as before.
+ * - Perform a product search, then exercise each sort dropdown option (popularity, rating, latest, price low→high, price high→low) and confirm the logs capture the expected resolved_sort token and ORDER BY clause alongside matching UI results.
+ * - Repeat the sort dropdown without a search term to ensure default catalog ordering remains unchanged.
+ * - Watch for SQL errors in the debug log and confirm relevance ordering is still applied when no explicit sort is chosen.
  */
 
 /**
@@ -961,16 +1212,16 @@ add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
  */
 function woo_search_opt_groupby( $groupby, $wp_query ) {
     global $wpdb;
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
     $context = array(
         'flags'            => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'    => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_groupby' => woo_search_opt_truncate_for_logging( $groupby ),
         'resolved_search'  => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'         => 'pending',
-        'resolved_sort'    => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
     );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
         $context['decision'] = 'bail_empty_search';
         woo_search_opt_log( 'woo_search_opt posts_groupby bail', $context );
@@ -993,16 +1244,17 @@ add_filter('posts_groupby', 'woo_search_opt_groupby', 20, 2);
  * @return array
  */
 function woo_search_opt_posts_clauses_logger( $clauses, $wp_query ) {
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
 
     if ( '' === $search_phrase ) {
-        woo_search_opt_log( 'woo_search_opt posts_clauses bail', array(
+        $context = array(
             'reason'          => 'empty_search',
             'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
             'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
-            'resolved_sort'   => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
-        ) );
+        );
+        $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+        woo_search_opt_log( 'woo_search_opt posts_clauses bail', $context );
         return $clauses;
     }
 
@@ -1014,12 +1266,14 @@ function woo_search_opt_posts_clauses_logger( $clauses, $wp_query ) {
         }
     }
 
-    woo_search_opt_log( 'woo_search_opt posts_clauses snapshot', array(
+    $context = array(
         'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
         'clauses'         => $clause_snapshot,
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
-        'resolved_sort'   => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
-    ) );
+    );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+
+    woo_search_opt_log( 'woo_search_opt posts_clauses snapshot', $context );
 
     return $clauses;
 }
@@ -1034,16 +1288,17 @@ add_filter( 'posts_clauses', 'woo_search_opt_posts_clauses_logger', 20, 2 );
  * @return array
  */
 function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
-    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
-    $sort_token    = woo_search_opt_detect_sort( $wp_query );
+    $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
+    $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
 
     if ( '' === $search_phrase ) {
-        woo_search_opt_log( 'woo_search_opt posts_results bail', array(
+        $context = array(
             'reason'          => 'empty_search',
             'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
             'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
-            'resolved_sort'   => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
-        ) );
+        );
+        $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+        woo_search_opt_log( 'woo_search_opt posts_results bail', $context );
         return $posts;
     }
 
@@ -1079,14 +1334,16 @@ function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
         }
     }
 
-    woo_search_opt_log( 'woo_search_opt posts_results summary', array(
+    $context = array(
         'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
         'total_results'   => count( $posts ),
         'logged_results'  => $summary,
         'truncated'       => count( $posts ) > $max_results,
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
-        'resolved_sort'   => woo_search_opt_sanitize_scalar_for_logging( $sort_token ),
-    ) );
+    );
+    $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
+
+    woo_search_opt_log( 'woo_search_opt posts_results summary', $context );
 
     return $posts;
 }
