@@ -42,11 +42,6 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
         $is_standard_wp_ajax  = function_exists( 'wp_doing_ajax' ) && wp_doing_ajax();
 
         if ( $is_admin_request && ! ( $is_standard_wp_ajax || $is_elementor_ajax ) ) {
-            woo_search_opt_log( 'woo_search_opt pre_get_posts skipped admin request', array(
-                'is_admin' => $is_admin_request,
-                'is_standard_wp_ajax' => $is_standard_wp_ajax,
-                'is_elementor_ajax' => $is_elementor_ajax,
-            ) );
             return;
         }
 
@@ -80,10 +75,6 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
         }
 
         if ( ! $has_product_post_type && ! $has_product_visibility_tax ) {
-            woo_search_opt_log( 'woo_search_opt pre_get_posts skipped non-product query', array(
-                'post_type' => $post_type,
-                'tax_query' => $tax_query,
-            ) );
             return;
         }
 
@@ -112,30 +103,18 @@ add_action( 'pre_get_posts', 'woo_search_opt_log_query', 19, 1 );
  */
 function woo_search_opt_joins( $join, $wp_query ) {
     global $wpdb;
-
+    
     $search_term = $wp_query->get('s');
     if ( empty( $search_term ) ) {
-        woo_search_opt_log( 'woo_search_opt_joins skipped empty search', array(
-            'is_main_query' => $wp_query->is_main_query(),
-            'post_type' => $wp_query->get( 'post_type' ),
-        ) );
         return $join;
     }
-
+    
     // Only modify queries for products.
     $post_types = $wp_query->get('post_type');
-    if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
+    if ( (is_array($post_types) && ! in_array('product', $post_types)) || 
          (!is_array($post_types) && 'product' !== $post_types) ) {
-        woo_search_opt_log( 'woo_search_opt_joins skipped non-product query', array(
-            'post_type' => $post_types,
-        ) );
         return $join;
     }
-
-    woo_search_opt_log( 'woo_search_opt_joins start', array(
-        'search_term' => $search_term,
-        'is_main_query' => $wp_query->is_main_query(),
-    ) );
     
     // Join postmeta for price and SKU.
     $join .= " LEFT JOIN {$wpdb->postmeta} AS woo_pm_price ON ({$wpdb->posts}.ID = woo_pm_price.post_id AND woo_pm_price.meta_key = '_price') ";
@@ -168,12 +147,8 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
         'search_phrase' => $search_phrase,
         'orderby' => $wp_query->get( 'orderby' ),
         'is_main_query' => $wp_query->is_main_query(),
-        'initial_search_clause' => $search,
     ) );
     if ( '' === $search_phrase ) {
-        woo_search_opt_log( 'woo_search_opt_posts_search skipped empty search', array(
-            'search_term' => $search_term,
-        ) );
         return $search;
     }
 
@@ -181,9 +156,6 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
     $post_types = $wp_query->get('post_type');
     if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
          (!is_array($post_types) && 'product' !== $post_types) ) {
-        woo_search_opt_log( 'woo_search_opt_posts_search skipped non-product query', array(
-            'post_type' => $post_types,
-        ) );
         return $search;
     }
 
@@ -194,15 +166,8 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
 
     $tokens = array_filter( array_map( 'trim', $tokenized_phrase ), 'strlen' );
     if ( empty( $tokens ) ) {
-        woo_search_opt_log( 'woo_search_opt_posts_search no valid tokens', array(
-            'tokenized_phrase' => $tokenized_phrase,
-        ) );
         return $search;
     }
-
-    woo_search_opt_log( 'woo_search_opt_posts_search tokenized', array(
-        'tokens' => $tokens,
-    ) );
 
     $token_clauses = array();
     foreach ( $tokens as $token_original ) {
@@ -226,10 +191,6 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
 
     $custom_search = '( ' . implode( ' AND ', $token_clauses ) . ' )';
 
-    woo_search_opt_log( 'woo_search_opt_posts_search custom clause built', array(
-        'custom_search' => $custom_search,
-    ) );
-
     // Combine with the default search conditions.
     if ( ! empty( $search ) ) {
         // Remove any leading "AND" from the default search clause.
@@ -238,10 +199,6 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
     } else {
         $search = " AND ( $custom_search ) ";
     }
-
-    woo_search_opt_log( 'woo_search_opt_posts_search final clause', array(
-        'final_search_clause' => $search,
-    ) );
 
     return $search;
 }
@@ -265,12 +222,8 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
         'search_phrase' => $search_phrase,
         'orderby' => $wp_query->get( 'orderby' ),
         'is_main_query' => $wp_query->is_main_query(),
-        'initial_fields' => $fields,
     ) );
     if ( '' === $search_phrase ) {
-        woo_search_opt_log( 'woo_search_opt_relevance skipped empty search', array(
-            'search_term' => $search_term,
-        ) );
         return $fields;
     }
 
@@ -283,10 +236,6 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
     }
 
     $tokens = array_filter( array_map( 'trim', $tokenized_phrase ), 'strlen' );
-
-    woo_search_opt_log( 'woo_search_opt_relevance tokens processed', array(
-        'tokens' => $tokens,
-    ) );
 
     $title_exact_phrase_sql = "(CASE WHEN {$wpdb->posts}.post_title LIKE '{$phrase_like_escaped}' THEN 1 ELSE 0 END) AS title_exact_phrase";
     $exact_match_sql = "(CASE WHEN ( {$wpdb->posts}.post_title LIKE '{$phrase_like_escaped}' OR {$wpdb->posts}.post_content LIKE '{$phrase_like_escaped}' ) THEN 1 ELSE 0 END) AS exact_match";
@@ -397,10 +346,6 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
     $fields .= ', (' . $universal_penalty_sql . ') AS universal_penalty';
     $fields .= ', (' . $relevance_sql . ' - (' . $universal_penalty_sql . ')) AS relevance';
 
-    woo_search_opt_log( 'woo_search_opt_relevance final fields', array(
-        'final_fields' => $fields,
-    ) );
-
     return $fields;
 }
 add_filter('posts_fields', 'woo_search_opt_relevance', 20, 2);
@@ -419,16 +364,10 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
         'is_main_query' => $wp_query->is_main_query(),
     ) );
     if ( '' === $search_phrase ) {
-        woo_search_opt_log( 'woo_search_opt_orderby skipped empty search', array(
-            'search_term' => $search_term,
-        ) );
         return $orderby;
     }
 
     $orderby = "title_exact_phrase DESC, title_ordered_phrase DESC, title_all_tokens DESC, title_token_hits DESC, attr_all_tokens DESC, content_all_tokens DESC, overall_token_hits DESC, token_score DESC, relevance DESC, {$wpdb->posts}.post_title ASC";
-    woo_search_opt_log( 'woo_search_opt_orderby final', array(
-        'orderby_clause' => $orderby,
-    ) );
     return $orderby;
 }
 add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
@@ -444,10 +383,6 @@ function woo_search_opt_groupby( $groupby, $wp_query ) {
         'search_phrase' => $search_phrase,
         'orderby' => $wp_query->get( 'orderby' ),
         'is_main_query' => $wp_query->is_main_query(),
-        'initial_groupby' => $groupby,
-    ) );
-    woo_search_opt_log( 'woo_search_opt_groupby final', array(
-        'groupby_clause' => "{$wpdb->posts}.ID",
     ) );
     $groupby = "{$wpdb->posts}.ID";
     return $groupby;
