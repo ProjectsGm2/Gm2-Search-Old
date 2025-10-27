@@ -255,7 +255,14 @@ function woo_search_opt_collect_request_vars( $keys = null ) {
         return array();
     }
 
-    $whitelist = is_array( $keys ) ? $keys : array_keys( $request );
+    $extra_keys = array( 'gm2_search_term' );
+
+    if ( is_array( $keys ) ) {
+        $whitelist = array_unique( array_merge( $keys, $extra_keys ) );
+    } else {
+        $whitelist = array_keys( $request );
+    }
+
     $collected = array();
 
     foreach ( $whitelist as $key ) {
@@ -274,6 +281,50 @@ function woo_search_opt_collect_request_vars( $keys = null ) {
     }
 
     return $collected;
+}
+
+/**
+ * Resolve the active search phrase for the current query or request context.
+ *
+ * @param WP_Query|null $wp_query Optional query instance to inspect.
+ *
+ * @return string
+ */
+function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
+    if ( $wp_query instanceof WP_Query ) {
+        $search_term = $wp_query->get( 's' );
+
+        if ( is_string( $search_term ) ) {
+            $search_term = trim( $search_term );
+
+            if ( '' !== $search_term ) {
+                return $search_term;
+            }
+        }
+    }
+
+    $request_keys = array( 's', 'search', 'gm2_search_term', 'keyword' );
+
+    foreach ( $request_keys as $key ) {
+        if ( ! isset( $_REQUEST[ $key ] ) ) {
+            continue;
+        }
+
+        $value = $_REQUEST[ $key ];
+
+        if ( is_array( $value ) ) {
+            continue;
+        }
+
+        $value = sanitize_text_field( wp_unslash( $value ) );
+        $value = trim( $value );
+
+        if ( '' !== $value ) {
+            return $value;
+        }
+    }
+
+    return '';
 }
 
 /**
@@ -375,15 +426,30 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
         $is_admin_request    = is_admin();
         $is_elementor_ajax   = isset( $_REQUEST['elementor_ajax'] );
         $is_standard_wp_ajax = function_exists( 'wp_doing_ajax' ) && wp_doing_ajax();
+        $resolved_search       = woo_search_opt_resolve_search_phrase( $query );
+        $resolved_search_safe  = woo_search_opt_sanitize_scalar_for_logging( $resolved_search );
+        $request_action        = isset( $_REQUEST['action'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['action'] ) ) : '';
+        $search_term_injected  = false;
+
+        if ( 'gm2_filter_products' === $request_action && '' !== $resolved_search ) {
+            $query_search = $query->get( 's' );
+
+            if ( ! is_string( $query_search ) || '' === trim( $query_search ) ) {
+                $query->set( 's', $resolved_search );
+                $search_term_injected = true;
+            }
+        }
 
         $context = array(
             'flags'                => woo_search_opt_extract_query_flags( $query ),
-            'request_vars'         => woo_search_opt_collect_request_vars( array( 's', 'post_type', 'orderby', 'elementor_ajax', 'action' ) ),
+            'request_vars'         => woo_search_opt_collect_request_vars( array( 's', 'gm2_search_term', 'post_type', 'orderby', 'elementor_ajax', 'action' ) ),
             'tax_query'            => woo_search_opt_normalize_context_value( $query->get( 'tax_query' ) ),
             'product_visibility'   => false,
             'decision'             => 'pending',
             'elementor_ajax_input' => $is_elementor_ajax,
             'wp_ajax'              => $is_standard_wp_ajax,
+            'resolved_search'      => $resolved_search_safe,
+            'search_term_injected' => $search_term_injected,
         );
 
         if ( $is_admin_request && ! ( $is_standard_wp_ajax || $is_elementor_ajax ) ) {
@@ -443,11 +509,12 @@ add_action( 'pre_get_posts', 'woo_search_opt_log_query', 19, 1 );
 function woo_search_opt_joins( $join, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    if ( empty( $search_term ) ) {
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
+    if ( '' === $search_phrase ) {
         woo_search_opt_log( 'woo_search_opt posts_join bail', array(
-            'reason' => 'empty_search',
-            'flags'  => woo_search_opt_extract_query_flags( $wp_query ),
+            'reason'          => 'empty_search',
+            'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
+            'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         ) );
         return $join;
     }
@@ -482,7 +549,7 @@ function woo_search_opt_joins( $join, $wp_query ) {
 
     woo_search_opt_log( 'woo_search_opt posts_join applied', array(
         'flags'          => woo_search_opt_extract_query_flags( $wp_query ),
-        'search_term'    => woo_search_opt_sanitize_scalar_for_logging( $search_term ),
+        'search_term'    => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_join'  => $initial_join,
         'outgoing_join'  => woo_search_opt_truncate_for_logging( $join ),
         'attribute_join' => 'pa_% taxonomy aggregation',
@@ -499,12 +566,12 @@ add_filter('posts_join', 'woo_search_opt_joins', 20, 2);
 function woo_search_opt_posts_search( $search, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
     $context = array(
         'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
         'incoming_search' => woo_search_opt_truncate_for_logging( $search ),
         'search_phrase'   => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
+        'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'        => 'pending',
     );
     if ( '' === $search_phrase ) {
@@ -592,12 +659,12 @@ add_filter('posts_search', 'woo_search_opt_posts_search', 20, 2);
 function woo_search_opt_relevance( $fields, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
     $context = array(
         'flags'          => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'  => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_field' => woo_search_opt_truncate_for_logging( $fields ),
+        'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'       => 'pending',
     );
     if ( '' === $search_phrase ) {
@@ -748,12 +815,12 @@ add_filter('posts_fields', 'woo_search_opt_relevance', 20, 2);
 function woo_search_opt_orderby( $orderby, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
     $context = array(
         'flags'             => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'     => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_orderby'  => woo_search_opt_truncate_for_logging( $orderby ),
+        'resolved_search'   => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'          => 'pending',
     );
     if ( '' === $search_phrase ) {
@@ -775,12 +842,12 @@ add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
  */
 function woo_search_opt_groupby( $groupby, $wp_query ) {
     global $wpdb;
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
     $context = array(
         'flags'            => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'    => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_groupby' => woo_search_opt_truncate_for_logging( $groupby ),
+        'resolved_search'  => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'         => 'pending',
     );
     if ( '' === $search_phrase ) {
@@ -805,13 +872,13 @@ add_filter('posts_groupby', 'woo_search_opt_groupby', 20, 2);
  * @return array
  */
 function woo_search_opt_posts_clauses_logger( $clauses, $wp_query ) {
-    $search_term   = $wp_query->get( 's' );
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
 
     if ( '' === $search_phrase ) {
         woo_search_opt_log( 'woo_search_opt posts_clauses bail', array(
-            'reason' => 'empty_search',
-            'flags'  => woo_search_opt_extract_query_flags( $wp_query ),
+            'reason'          => 'empty_search',
+            'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
+            'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         ) );
         return $clauses;
     }
@@ -825,8 +892,9 @@ function woo_search_opt_posts_clauses_logger( $clauses, $wp_query ) {
     }
 
     woo_search_opt_log( 'woo_search_opt posts_clauses snapshot', array(
-        'flags'   => woo_search_opt_extract_query_flags( $wp_query ),
-        'clauses' => $clause_snapshot,
+        'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
+        'clauses'         => $clause_snapshot,
+        'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
     ) );
 
     return $clauses;
@@ -842,13 +910,13 @@ add_filter( 'posts_clauses', 'woo_search_opt_posts_clauses_logger', 20, 2 );
  * @return array
  */
 function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
-    $search_term   = $wp_query->get( 's' );
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = woo_search_opt_resolve_search_phrase( $wp_query );
 
     if ( '' === $search_phrase ) {
         woo_search_opt_log( 'woo_search_opt posts_results bail', array(
-            'reason' => 'empty_search',
-            'flags'  => woo_search_opt_extract_query_flags( $wp_query ),
+            'reason'          => 'empty_search',
+            'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
+            'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         ) );
         return $posts;
     }
@@ -886,12 +954,199 @@ function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
     }
 
     woo_search_opt_log( 'woo_search_opt posts_results summary', array(
-        'flags'          => woo_search_opt_extract_query_flags( $wp_query ),
-        'total_results'  => count( $posts ),
-        'logged_results' => $summary,
-        'truncated'      => count( $posts ) > $max_results,
+        'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
+        'total_results'   => count( $posts ),
+        'logged_results'  => $summary,
+        'truncated'       => count( $posts ) > $max_results,
+        'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
     ) );
 
     return $posts;
 }
 add_filter( 'posts_results', 'woo_search_opt_posts_results_logger', 20, 2 );
+
+/**
+ * Enqueue an inline helper script to persist the latest search phrase through AJAX sorters.
+ */
+function woo_search_opt_enqueue_frontend_script() {
+    if ( is_admin() ) {
+        return;
+    }
+
+    wp_enqueue_script( 'jquery' );
+
+    $script = <<<'JS'
+(function($){
+    var lastQuery = '';
+
+    function setLastQuery(value) {
+        lastQuery = (value || '').toString();
+        window.wooSearchOptLastQuery = lastQuery;
+    }
+
+    function getLastQuery() {
+        var stored = window.wooSearchOptLastQuery;
+        if (typeof stored === 'string') {
+            return stored;
+        }
+        if (stored && stored.toString) {
+            return stored.toString();
+        }
+        return lastQuery;
+    }
+
+    function ensureTermOnForm($form) {
+        if (!$form || !$form.length) {
+            return;
+        }
+
+        var term = getLastQuery();
+        var $gm2Field = $form.find('input[name="gm2_search_term"]');
+
+        if (!$gm2Field.length) {
+            $gm2Field = $('<input>', { type: 'hidden', name: 'gm2_search_term' }).appendTo($form);
+        }
+
+        $gm2Field.val(term);
+
+        var $sField = $form.find('input[name="s"]');
+
+        if (!$sField.length) {
+            $sField = $('<input>', { type: 'hidden', name: 's' }).appendTo($form);
+        }
+
+        $sField.val(term);
+    }
+
+    function bootstrapFromLocation() {
+        if (getLastQuery()) {
+            return;
+        }
+
+        if (typeof URLSearchParams === 'undefined') {
+            return;
+        }
+
+        var params = new URLSearchParams(window.location.search || '');
+        var fallback = params.get('s') || params.get('search') || params.get('gm2_search_term') || params.get('keyword') || '';
+
+        if (fallback) {
+            setLastQuery(fallback);
+        }
+    }
+
+    $(function(){
+        var $searchForms = $('form.woocommerce-product-search');
+
+        if ($searchForms.length) {
+            $searchForms.each(function(){
+                var $form = $(this);
+                var $input = $form.find('input[name="s"]');
+
+                if (!$input.length) {
+                    return;
+                }
+
+                setLastQuery($input.first().val());
+
+                $input.on('input change', function(){
+                    setLastQuery($(this).val());
+                });
+
+                $form.on('submit', function(){
+                    setLastQuery($input.first().val());
+                });
+            });
+        }
+
+        bootstrapFromLocation();
+
+        $(document).on('change', '.woocommerce-ordering select[name="orderby"]', function(){
+            var $form = $(this).closest('form');
+            ensureTermOnForm($form);
+        });
+
+        $(document).on('submit', '.woocommerce-ordering form, form.woocommerce-ordering, form.gm2-filter-products-form', function(){
+            ensureTermOnForm($(this));
+        });
+
+        $(document).ajaxSend(function(event, jqXHR, settings){
+            if (!settings || !settings.data) {
+                return;
+            }
+
+            var term = getLastQuery();
+
+            if (typeof term !== 'string') {
+                term = term ? term.toString() : '';
+            }
+
+            if (!term) {
+                return;
+            }
+
+            var handleStringData = function(dataString) {
+                if (dataString.indexOf('action=gm2_filter_products') === -1) {
+                    return dataString;
+                }
+
+                var encodedTerm = encodeURIComponent(term);
+                var gm2Regex = /gm2_search_term=[^&]*/;
+                var sRegex = /s=[^&]*/;
+
+                if (gm2Regex.test(dataString)) {
+                    dataString = dataString.replace(gm2Regex, 'gm2_search_term=' + encodedTerm);
+                } else {
+                    dataString += '&gm2_search_term=' + encodedTerm;
+                }
+
+                if (sRegex.test(dataString)) {
+                    dataString = dataString.replace(sRegex, 's=' + encodedTerm);
+                } else {
+                    dataString += '&s=' + encodedTerm;
+                }
+
+                return dataString;
+            };
+
+            if (typeof settings.data === 'string') {
+                settings.data = handleStringData(settings.data);
+                return;
+            }
+
+            if (typeof URLSearchParams !== 'undefined' && settings.data instanceof URLSearchParams) {
+                if (settings.data.get('action') !== 'gm2_filter_products') {
+                    return;
+                }
+
+                settings.data.set('gm2_search_term', term);
+                settings.data.set('s', term);
+                return;
+            }
+
+            if (typeof FormData !== 'undefined' && settings.data instanceof FormData) {
+                if (settings.data.get('action') !== 'gm2_filter_products') {
+                    return;
+                }
+
+                settings.data.set('gm2_search_term', term);
+                settings.data.set('s', term);
+                return;
+            }
+
+            if ($.isPlainObject(settings.data)) {
+                if (settings.data.action !== 'gm2_filter_products') {
+                    return;
+                }
+
+                settings.data.gm2_search_term = term;
+                settings.data.s = term;
+            }
+        });
+    });
+})(jQuery);
+JS;
+
+    wp_add_inline_script( 'jquery', $script );
+}
+add_action( 'wp_enqueue_scripts', 'woo_search_opt_enqueue_frontend_script' );
