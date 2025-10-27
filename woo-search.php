@@ -37,7 +37,7 @@ if ( ! function_exists( 'woo_search_opt_log' ) ) {
 
 if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
     function woo_search_opt_log_query( WP_Query $query ) {
-        if ( is_admin() ) {
+        if ( is_admin() && ! ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) ) {
             return;
         }
 
