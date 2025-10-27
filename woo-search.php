@@ -346,119 +346,24 @@ function woo_search_opt_clear_last_search_phrase() {
  * @return string
  */
 function woo_search_opt_extract_search_from_referer() {
-    $params = woo_search_opt_extract_referer_query_params();
-
-    if ( empty( $params['s'] ) || ! is_string( $params['s'] ) ) {
-        return '';
-    }
-
-    return sanitize_text_field( $params['s'] );
-}
-
-/**
- * Extract query params from the referer URL.
- *
- * @return array
- */
-function woo_search_opt_extract_referer_query_params() {
     if ( empty( $_SERVER['HTTP_REFERER'] ) ) {
-        return array();
+        return '';
     }
 
     $referer = wp_unslash( $_SERVER['HTTP_REFERER'] );
     $parts   = wp_parse_url( $referer );
 
     if ( empty( $parts['query'] ) ) {
-        return array();
+        return '';
     }
 
     parse_str( $parts['query'], $params );
 
-    if ( ! is_array( $params ) ) {
-        return array();
+    if ( empty( $params['s'] ) || ! is_string( $params['s'] ) ) {
+        return '';
     }
 
-    return $params;
-}
-
-/**
- * Extract query vars supplied with the AJAX request.
- *
- * @return array
- */
-function woo_search_opt_extract_query_vars_from_request() {
-    if ( empty( $_REQUEST['query_vars'] ) ) {
-        return array();
-    }
-
-    $raw = wp_unslash( $_REQUEST['query_vars'] );
-
-    if ( is_array( $raw ) ) {
-        return $raw;
-    }
-
-    if ( is_string( $raw ) ) {
-        $decoded = json_decode( $raw, true );
-
-        if ( is_array( $decoded ) ) {
-            return $decoded;
-        }
-
-        parse_str( $raw, $parsed );
-
-        if ( is_array( $parsed ) ) {
-            return $parsed;
-        }
-    }
-
-    return array();
-}
-
-/**
- * Determine if the current AJAX request represents a product search context.
- *
- * @return array{
- *     has_param: bool,
- *     phrase: string,
- * }
- */
-function woo_search_opt_determine_search_context() {
-    $context = array(
-        'has_param' => false,
-        'phrase'    => '',
-    );
-
-    $request_vars = woo_search_opt_extract_query_vars_from_request();
-
-    if ( array_key_exists( 's', $request_vars ) ) {
-        $context['has_param'] = true;
-
-        if ( is_string( $request_vars['s'] ) ) {
-            $maybe_phrase = trim( $request_vars['s'] );
-
-            if ( '' !== $maybe_phrase ) {
-                $context['phrase'] = sanitize_text_field( $maybe_phrase );
-
-                return $context;
-            }
-        }
-    }
-
-    $referer_params = woo_search_opt_extract_referer_query_params();
-
-    if ( array_key_exists( 's', $referer_params ) ) {
-        $context['has_param'] = true;
-
-        if ( is_string( $referer_params['s'] ) ) {
-            $maybe_phrase = trim( $referer_params['s'] );
-
-            if ( '' !== $maybe_phrase ) {
-                $context['phrase'] = sanitize_text_field( $maybe_phrase );
-            }
-        }
-    }
-
-    return $context;
+    return sanitize_text_field( $params['s'] );
 }
 
 /**
@@ -521,13 +426,7 @@ function woo_search_opt_restore_search_phrase_for_ajax( WP_Query $query ) {
         return;
     }
 
-    $context = woo_search_opt_determine_search_context();
-
-    if ( ! $context['has_param'] ) {
-        return;
-    }
-
-    $referer_phrase = $context['phrase'];
+    $referer_phrase = woo_search_opt_extract_search_from_referer();
 
     if ( '' === $referer_phrase ) {
         $referer_phrase = woo_search_opt_get_last_search_phrase();
