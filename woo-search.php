@@ -13,18 +13,113 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+if ( ! function_exists( 'woo_search_opt_get_query_phrase' ) ) {
+    /**
+     * Retrieve the active search phrase for a given query.
+     */
+    function woo_search_opt_get_query_phrase( WP_Query $query ) {
+        $phrase = '';
+
+        $active = $query->get( 'woo_search_opt_active' );
+        if ( $active ) {
+            $phrase = $query->get( 's' );
+        } else {
+            $raw = $query->get( 's' );
+            if ( ! empty( $raw ) ) {
+                $phrase = $raw;
+            }
+        }
+
+        if ( is_string( $phrase ) ) {
+            return trim( $phrase );
+        }
+
+        if ( is_scalar( $phrase ) ) {
+            return trim( strval( $phrase ) );
+        }
+
+        return '';
+    }
+}
+
+if ( ! function_exists( 'woo_search_opt_preserve_search' ) ) {
+    /**
+     * Preserve the original search term for Elementor ordering requests.
+     */
+    function woo_search_opt_preserve_search( WP_Query $query ) {
+        if ( is_admin() || ! $query->is_main_query() ) {
+            return;
+        }
+
+        $existing = $query->get( 's' );
+        if ( is_string( $existing ) ) {
+            $existing = trim( $existing );
+        }
+
+        if ( ! empty( $existing ) ) {
+            return;
+        }
+
+        $post_types = $query->get( 'post_type' );
+        $is_product_query = false;
+
+        if ( is_array( $post_types ) ) {
+            $is_product_query = in_array( 'product', $post_types, true );
+        } elseif ( ! empty( $post_types ) ) {
+            $is_product_query = ( 'product' === $post_types );
+        }
+
+        if ( ! $is_product_query && function_exists( 'is_product_search' ) && is_product_search() ) {
+            $is_product_query = true;
+        }
+
+        if ( ! $is_product_query ) {
+            return;
+        }
+
+        $raw_search = null;
+        if ( isset( $_GET['s'] ) && '' !== trim( (string) $_GET['s'] ) ) {
+            $raw_search = $_GET['s'];
+        } elseif ( isset( $_REQUEST['s'] ) && '' !== trim( (string) $_REQUEST['s'] ) ) {
+            $raw_search = $_REQUEST['s'];
+        }
+
+        if ( null === $raw_search ) {
+            return;
+        }
+
+        $sanitized_search = sanitize_text_field( wp_unslash( $raw_search ) );
+        if ( '' === $sanitized_search ) {
+            return;
+        }
+
+        $query->set( 's', $sanitized_search );
+        $query->set( 'woo_search_opt_active', true );
+
+        if ( defined( 'WOO_SEARCH_OPT_DEBUG' ) && WOO_SEARCH_OPT_DEBUG ) {
+            error_log( sprintf( 'woo_search_opt_preserve_search phrase="%s"', $sanitized_search ) );
+        }
+    }
+}
+add_action( 'pre_get_posts', 'woo_search_opt_preserve_search', 20 );
+
 /**
  * Add JOINs for _price, _sku, and aggregated product attributes.
  * Unique alias names are used to avoid conflicts.
  */
 function woo_search_opt_joins( $join, $wp_query ) {
     global $wpdb;
-    
-    $search_term = $wp_query->get('s');
-    if ( empty( $search_term ) ) {
+
+    if ( function_exists( 'woo_search_opt_get_query_phrase' ) ) {
+        $search_phrase = woo_search_opt_get_query_phrase( $wp_query );
+    } else {
+        $search_phrase = '';
+    }
+
+    if ( '' === $search_phrase ) {
         return $join;
     }
-    
+
     // Only modify queries for products.
     $post_types = $wp_query->get('post_type');
     if ( (is_array($post_types) && ! in_array('product', $post_types)) || 
@@ -57,8 +152,7 @@ add_filter('posts_join', 'woo_search_opt_joins', 20, 2);
 function woo_search_opt_posts_search( $search, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = function_exists( 'woo_search_opt_get_query_phrase' ) ? woo_search_opt_get_query_phrase( $wp_query ) : '';
     if ( '' === $search_phrase ) {
         return $search;
     }
@@ -127,8 +221,7 @@ add_filter('posts_search', 'woo_search_opt_posts_search', 20, 2);
 function woo_search_opt_relevance( $fields, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = function_exists( 'woo_search_opt_get_query_phrase' ) ? woo_search_opt_get_query_phrase( $wp_query ) : '';
     if ( '' === $search_phrase ) {
         return $fields;
     }
@@ -262,10 +355,26 @@ add_filter('posts_fields', 'woo_search_opt_relevance', 20, 2);
 function woo_search_opt_orderby( $orderby, $wp_query ) {
     global $wpdb;
 
-    $search_term = $wp_query->get('s');
-    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    $search_phrase = function_exists( 'woo_search_opt_get_query_phrase' ) ? woo_search_opt_get_query_phrase( $wp_query ) : '';
     if ( '' === $search_phrase ) {
         return $orderby;
+    }
+
+    $explicit_orderby = $wp_query->get( 'orderby' );
+    if ( empty( $explicit_orderby ) && isset( $_GET['orderby'] ) && '' !== trim( (string) $_GET['orderby'] ) ) {
+        $explicit_orderby = $_GET['orderby'];
+    }
+
+    if ( ! empty( $explicit_orderby ) ) {
+        if ( defined( 'WOO_SEARCH_OPT_DEBUG' ) && WOO_SEARCH_OPT_DEBUG ) {
+            error_log( sprintf( 'woo_search_opt_orderby preserved phrase="%s" external_orderby="%s"', $search_phrase, is_scalar( $explicit_orderby ) ? $explicit_orderby : wp_json_encode( $explicit_orderby ) ) );
+        }
+
+        return $orderby;
+    }
+
+    if ( defined( 'WOO_SEARCH_OPT_DEBUG' ) && WOO_SEARCH_OPT_DEBUG ) {
+        error_log( sprintf( 'woo_search_opt_orderby applying relevance phrase="%s"', $search_phrase ) );
     }
 
     $orderby = "title_exact_phrase DESC, title_ordered_phrase DESC, title_all_tokens DESC, title_token_hits DESC, attr_all_tokens DESC, content_all_tokens DESC, overall_token_hits DESC, token_score DESC, relevance DESC, {$wpdb->posts}.post_title ASC";
@@ -278,6 +387,12 @@ add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
  */
 function woo_search_opt_groupby( $groupby, $wp_query ) {
     global $wpdb;
+
+    $search_phrase = function_exists( 'woo_search_opt_get_query_phrase' ) ? woo_search_opt_get_query_phrase( $wp_query ) : '';
+    if ( '' === $search_phrase ) {
+        return $groupby;
+    }
+
     $groupby = "{$wpdb->posts}.ID";
     return $groupby;
 }
