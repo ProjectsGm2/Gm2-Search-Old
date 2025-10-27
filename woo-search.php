@@ -143,13 +143,25 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
 
     $tokens = array_filter( array_map( 'trim', $tokenized_phrase ), 'strlen' );
 
+    $title_exact_phrase_sql = "(CASE WHEN {$wpdb->posts}.post_title LIKE '{$phrase_like_escaped}' THEN 1 ELSE 0 END) AS title_exact_phrase";
     $exact_match_sql = "(CASE WHEN ( {$wpdb->posts}.post_title LIKE '{$phrase_like_escaped}' OR {$wpdb->posts}.post_content LIKE '{$phrase_like_escaped}' ) THEN 1 ELSE 0 END) AS exact_match";
 
     $token_score_parts = array();
     $relevance_parts = array();
+    $title_token_hit_parts = array();
+    $attr_token_hit_parts = array();
+    $content_token_hit_parts = array();
+    $overall_token_hit_parts = array();
+    $ordered_regex_parts = array();
+
+    $seen_tokens = array();
 
     foreach ( $tokens as $token_original ) {
         $token_lower = function_exists( 'mb_strtolower' ) ? mb_strtolower( $token_original, 'UTF-8' ) : strtolower( $token_original );
+        if ( isset( $seen_tokens[ $token_lower ] ) ) {
+            continue;
+        }
+        $seen_tokens[ $token_lower ] = true;
         $token_like = '%' . $wpdb->esc_like( $token_lower ) . '%';
         $token_like_escaped = esc_sql( $token_like );
 
@@ -157,14 +169,33 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
         $token_price_like = '%' . $wpdb->esc_like( $token_price ) . '%';
         $token_price_like_escaped = esc_sql( $token_price_like );
 
-        $token_score_parts[] = "(CASE"
-            . " WHEN LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}' THEN 10"
-            . " WHEN LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}' THEN 8"
-            . " WHEN LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}' THEN 6"
-            . " WHEN LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}' THEN 5"
-            . " WHEN (LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
-                . " OR LOWER(REPLACE(COALESCE(woo_pm_price.meta_value, ''), '$', '')) LIKE '{$token_price_like_escaped}') THEN 4"
-            . " ELSE 0 END)";
+        $title_match_case = "CASE WHEN LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}' THEN 1 ELSE 0 END";
+        $attr_match_case = "CASE WHEN LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}' THEN 1 ELSE 0 END";
+        $content_match_case = "CASE WHEN LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}' THEN 1 ELSE 0 END";
+        $title_token_hit_parts[] = $title_match_case;
+        $attr_token_hit_parts[] = $attr_match_case;
+        $content_token_hit_parts[] = $content_match_case;
+
+        $overall_condition = "("
+            . "LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}'"
+            . " OR LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}'"
+            . " OR LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}'"
+            . " OR LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}'"
+            . " OR LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
+            . " OR LOWER(REPLACE(COALESCE(woo_pm_price.meta_value, ''), '$', '')) LIKE '{$token_price_like_escaped}'"
+        . ")";
+        $overall_token_hit_parts[] = "CASE WHEN {$overall_condition} THEN 1 ELSE 0 END";
+
+        $token_score_cases = array(
+            "CASE WHEN LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}' THEN 10 ELSE 0 END",
+            "CASE WHEN LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}' THEN 8 ELSE 0 END",
+            "CASE WHEN LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}' THEN 6 ELSE 0 END",
+            "CASE WHEN LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}' THEN 5 ELSE 0 END",
+            "CASE WHEN (LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
+                . " OR LOWER(REPLACE(COALESCE(woo_pm_price.meta_value, ''), '$', '')) LIKE '{$token_price_like_escaped}') THEN 4 ELSE 0 END",
+        );
+
+        $token_score_parts[] = 'GREATEST(' . implode( ', ', $token_score_cases ) . ', 0)';
 
         $relevance_parts[] = "(CASE WHEN LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}' THEN 100 ELSE 0 END)";
         $relevance_parts[] = "(CASE WHEN (LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
@@ -172,10 +203,30 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
         $relevance_parts[] = "(CASE WHEN LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}' THEN 80 ELSE 0 END)";
         $relevance_parts[] = "(CASE WHEN LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}' THEN 70 ELSE 0 END)";
         $relevance_parts[] = "(CASE WHEN LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}' THEN 60 ELSE 0 END)";
+
+        $ordered_regex_parts[] = preg_quote( $token_lower, '/' );
     }
+
+    $token_count = count( $seen_tokens );
 
     $token_score_sql = empty( $token_score_parts ) ? '0 AS token_score' : '( ' . implode( ' + ', $token_score_parts ) . ' ) AS token_score';
     $relevance_sql = empty( $relevance_parts ) ? '0' : '( ' . implode( ' + ', $relevance_parts ) . ' )';
+
+    $title_token_hits_expr = empty( $title_token_hit_parts ) ? '0' : '( ' . implode( ' + ', $title_token_hit_parts ) . ' )';
+    $attr_token_hits_expr = empty( $attr_token_hit_parts ) ? '0' : '( ' . implode( ' + ', $attr_token_hit_parts ) . ' )';
+    $content_token_hits_expr = empty( $content_token_hit_parts ) ? '0' : '( ' . implode( ' + ', $content_token_hit_parts ) . ' )';
+    $overall_token_hits_expr = empty( $overall_token_hit_parts ) ? '0' : '( ' . implode( ' + ', $overall_token_hit_parts ) . ' )';
+
+    $title_all_tokens_expr = ( 0 === $token_count ) ? '0' : '(CASE WHEN ' . $title_token_hits_expr . ' >= ' . $token_count . ' THEN 1 ELSE 0 END)';
+    $attr_all_tokens_expr = ( 0 === $token_count ) ? '0' : '(CASE WHEN ' . $attr_token_hits_expr . ' >= ' . $token_count . ' THEN 1 ELSE 0 END)';
+    $content_all_tokens_expr = ( 0 === $token_count ) ? '0' : '(CASE WHEN ' . $content_token_hits_expr . ' >= ' . $token_count . ' THEN 1 ELSE 0 END)';
+
+    $title_ordered_phrase_expr = '0';
+    if ( ! empty( $ordered_regex_parts ) ) {
+        $ordered_regex_pattern = implode( '.*', $ordered_regex_parts );
+        $ordered_regex_escaped = esc_sql( $ordered_regex_pattern );
+        $title_ordered_phrase_expr = "(CASE WHEN {$wpdb->posts}.post_title REGEXP '{$ordered_regex_escaped}' THEN 1 ELSE 0 END)";
+    }
 
     $search_lower = function_exists( 'mb_strtolower' ) ? mb_strtolower( $search_phrase, 'UTF-8' ) : strtolower( $search_phrase );
     $search_lower_escaped = esc_sql( $search_lower );
@@ -187,7 +238,16 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
             . " OR LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '%universal%'"
         . ") THEN 20 ELSE 0 END";
 
+    $fields .= ', ' . $title_exact_phrase_sql;
     $fields .= ', ' . $exact_match_sql;
+    $fields .= ', ' . $title_token_hits_expr . ' AS title_token_hits';
+    $fields .= ', ' . $attr_token_hits_expr . ' AS attr_token_hits';
+    $fields .= ', ' . $content_token_hits_expr . ' AS content_token_hits';
+    $fields .= ', ' . $overall_token_hits_expr . ' AS overall_token_hits';
+    $fields .= ', ' . $title_all_tokens_expr . ' AS title_all_tokens';
+    $fields .= ', ' . $attr_all_tokens_expr . ' AS attr_all_tokens';
+    $fields .= ', ' . $content_all_tokens_expr . ' AS content_all_tokens';
+    $fields .= ', ' . $title_ordered_phrase_expr . ' AS title_ordered_phrase';
     $fields .= ', ' . $token_score_sql;
     $fields .= ', (' . $universal_penalty_sql . ') AS universal_penalty';
     $fields .= ', (' . $relevance_sql . ' - (' . $universal_penalty_sql . ')) AS relevance';
@@ -208,7 +268,7 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
         return $orderby;
     }
 
-    $orderby = "exact_match DESC, token_score DESC, relevance DESC, {$wpdb->posts}.post_title ASC";
+    $orderby = "title_exact_phrase DESC, title_ordered_phrase DESC, title_all_tokens DESC, title_token_hits DESC, attr_all_tokens DESC, content_all_tokens DESC, overall_token_hits DESC, token_score DESC, relevance DESC, {$wpdb->posts}.post_title ASC";
     return $orderby;
 }
 add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
