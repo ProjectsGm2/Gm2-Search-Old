@@ -56,33 +56,52 @@ add_filter('posts_join', 'woo_search_opt_joins', 20, 2);
  */
 function woo_search_opt_posts_search( $search, $wp_query ) {
     global $wpdb;
-    
+
     $search_term = $wp_query->get('s');
-    if ( empty( $search_term ) ) {
+    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    if ( '' === $search_phrase ) {
         return $search;
     }
-    
+
     // Only affect product queries.
     $post_types = $wp_query->get('post_type');
     if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
          (!is_array($post_types) && 'product' !== $post_types) ) {
         return $search;
     }
-    
-    // Prepare search patterns.
-    $like = '%' . $wpdb->esc_like( $search_term ) . '%';
-    $price_stripped = str_replace( '$', '', $search_term );
-    $price_like_stripped = '%' . $wpdb->esc_like( $price_stripped ) . '%';
-    
-    // Build our custom search conditions.
-    $custom_search = "(
-         {$wpdb->posts}.post_title LIKE '{$like}'
-         OR {$wpdb->posts}.post_content LIKE '{$like}'
-         OR (woo_pm_price.meta_value LIKE '{$like}' OR woo_pm_price.meta_value LIKE '{$price_like_stripped}')
-         OR (woo_attr.attributes LIKE '{$like}')
-         OR (woo_pm_sku.meta_value LIKE '{$like}')
-    )";
-    
+
+    $tokenized_phrase = preg_split( '/\s+/', $search_phrase );
+    if ( ! is_array( $tokenized_phrase ) ) {
+        $tokenized_phrase = array( $search_phrase );
+    }
+
+    $tokens = array_filter( array_map( 'trim', $tokenized_phrase ), 'strlen' );
+    if ( empty( $tokens ) ) {
+        return $search;
+    }
+
+    $token_clauses = array();
+    foreach ( $tokens as $token_original ) {
+        $token_lower = function_exists( 'mb_strtolower' ) ? mb_strtolower( $token_original, 'UTF-8' ) : strtolower( $token_original );
+        $token_like = '%' . $wpdb->esc_like( $token_lower ) . '%';
+        $token_like_escaped = esc_sql( $token_like );
+
+        $token_price = str_replace( '$', '', $token_lower );
+        $token_price_like = '%' . $wpdb->esc_like( $token_price ) . '%';
+        $token_price_like_escaped = esc_sql( $token_price_like );
+
+        $token_clauses[] = "("
+            . "LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}'"
+            . " OR LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}'"
+            . " OR (LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
+                . " OR LOWER(REPLACE(COALESCE(woo_pm_price.meta_value, ''), '$', '')) LIKE '{$token_price_like_escaped}')"
+            . " OR LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}'"
+            . " OR LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}'"
+        . ")";
+    }
+
+    $custom_search = '( ' . implode( ' AND ', $token_clauses ) . ' )';
+
     // Combine with the default search conditions.
     if ( ! empty( $search ) ) {
         // Remove any leading "AND" from the default search clause.
@@ -91,7 +110,7 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
     } else {
         $search = " AND ( $custom_search ) ";
     }
-    
+
     return $search;
 }
 add_filter('posts_search', 'woo_search_opt_posts_search', 20, 2);
@@ -107,41 +126,89 @@ add_filter('posts_search', 'woo_search_opt_posts_search', 20, 2);
  */
 function woo_search_opt_relevance( $fields, $wp_query ) {
     global $wpdb;
-    
+
     $search_term = $wp_query->get('s');
-    if ( empty( $search_term ) ) {
+    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    if ( '' === $search_phrase ) {
         return $fields;
     }
-    
-    $like = '%' . $wpdb->esc_like( $search_term ) . '%';
-    $price_stripped = str_replace( '$', '', $search_term );
-    $price_like_stripped = '%' . $wpdb->esc_like( $price_stripped ) . '%';
-    
-    $relevance = "(";
-    $relevance .= " (CASE WHEN {$wpdb->posts}.post_title LIKE '{$like}' THEN 100 ELSE 0 END) + ";
-    $relevance .= " (CASE WHEN (woo_pm_price.meta_value LIKE '{$like}' OR woo_pm_price.meta_value LIKE '{$price_like_stripped}') THEN 90 ELSE 0 END) + ";
-    $relevance .= " (CASE WHEN {$wpdb->posts}.post_content LIKE '{$like}' THEN 80 ELSE 0 END) + ";
-    $relevance .= " (CASE WHEN woo_attr.attributes LIKE '{$like}' THEN 70 ELSE 0 END) + ";
-    $relevance .= " (CASE WHEN woo_pm_sku.meta_value LIKE '{$like}' THEN 60 ELSE 0 END)";
-    $relevance .= ") AS relevance";
-    
-    $fields .= ", " . $relevance;
+
+    $phrase_like = '%' . $wpdb->esc_like( $search_phrase ) . '%';
+    $phrase_like_escaped = esc_sql( $phrase_like );
+
+    $tokenized_phrase = preg_split( '/\s+/', $search_phrase );
+    if ( ! is_array( $tokenized_phrase ) ) {
+        $tokenized_phrase = array( $search_phrase );
+    }
+
+    $tokens = array_filter( array_map( 'trim', $tokenized_phrase ), 'strlen' );
+
+    $exact_match_sql = "(CASE WHEN ( {$wpdb->posts}.post_title LIKE '{$phrase_like_escaped}' OR {$wpdb->posts}.post_content LIKE '{$phrase_like_escaped}' ) THEN 1 ELSE 0 END) AS exact_match";
+
+    $token_score_parts = array();
+    $relevance_parts = array();
+
+    foreach ( $tokens as $token_original ) {
+        $token_lower = function_exists( 'mb_strtolower' ) ? mb_strtolower( $token_original, 'UTF-8' ) : strtolower( $token_original );
+        $token_like = '%' . $wpdb->esc_like( $token_lower ) . '%';
+        $token_like_escaped = esc_sql( $token_like );
+
+        $token_price = str_replace( '$', '', $token_lower );
+        $token_price_like = '%' . $wpdb->esc_like( $token_price ) . '%';
+        $token_price_like_escaped = esc_sql( $token_price_like );
+
+        $token_score_parts[] = "(CASE"
+            . " WHEN LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}' THEN 10"
+            . " WHEN LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}' THEN 8"
+            . " WHEN LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}' THEN 6"
+            . " WHEN LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}' THEN 5"
+            . " WHEN (LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
+                . " OR LOWER(REPLACE(COALESCE(woo_pm_price.meta_value, ''), '$', '')) LIKE '{$token_price_like_escaped}') THEN 4"
+            . " ELSE 0 END)";
+
+        $relevance_parts[] = "(CASE WHEN LOWER({$wpdb->posts}.post_title) LIKE '{$token_like_escaped}' THEN 100 ELSE 0 END)";
+        $relevance_parts[] = "(CASE WHEN (LOWER(COALESCE(woo_pm_price.meta_value, '')) LIKE '{$token_like_escaped}'"
+            . " OR LOWER(REPLACE(COALESCE(woo_pm_price.meta_value, ''), '$', '')) LIKE '{$token_price_like_escaped}') THEN 90 ELSE 0 END)";
+        $relevance_parts[] = "(CASE WHEN LOWER({$wpdb->posts}.post_content) LIKE '{$token_like_escaped}' THEN 80 ELSE 0 END)";
+        $relevance_parts[] = "(CASE WHEN LOWER(COALESCE(woo_attr.attributes, '')) LIKE '{$token_like_escaped}' THEN 70 ELSE 0 END)";
+        $relevance_parts[] = "(CASE WHEN LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '{$token_like_escaped}' THEN 60 ELSE 0 END)";
+    }
+
+    $token_score_sql = empty( $token_score_parts ) ? '0 AS token_score' : '( ' . implode( ' + ', $token_score_parts ) . ' ) AS token_score';
+    $relevance_sql = empty( $relevance_parts ) ? '0' : '( ' . implode( ' + ', $relevance_parts ) . ' )';
+
+    $search_lower = function_exists( 'mb_strtolower' ) ? mb_strtolower( $search_phrase, 'UTF-8' ) : strtolower( $search_phrase );
+    $search_lower_escaped = esc_sql( $search_lower );
+    $universal_penalty_sql = "CASE WHEN LOCATE('universal', '{$search_lower_escaped}') = 0"
+        . " AND ("
+            . "LOWER({$wpdb->posts}.post_title) LIKE '%universal%'"
+            . " OR LOWER({$wpdb->posts}.post_content) LIKE '%universal%'"
+            . " OR LOWER(COALESCE(woo_attr.attributes, '')) LIKE '%universal%'"
+            . " OR LOWER(COALESCE(woo_pm_sku.meta_value, '')) LIKE '%universal%'"
+        . ") THEN 20 ELSE 0 END";
+
+    $fields .= ', ' . $exact_match_sql;
+    $fields .= ', ' . $token_score_sql;
+    $fields .= ', (' . $universal_penalty_sql . ') AS universal_penalty';
+    $fields .= ', (' . $relevance_sql . ' - (' . $universal_penalty_sql . ')) AS relevance';
+
     return $fields;
 }
 add_filter('posts_fields', 'woo_search_opt_relevance', 20, 2);
 
 /**
- * Order results by computed relevance (highest first) and then by post title.
+ * Order results by exact phrase, token score, overall relevance, and post title.
  */
 function woo_search_opt_orderby( $orderby, $wp_query ) {
     global $wpdb;
-    
+
     $search_term = $wp_query->get('s');
-    if ( empty( $search_term ) ) {
+    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    if ( '' === $search_phrase ) {
         return $orderby;
     }
-    
-    $orderby = "relevance DESC, {$wpdb->posts}.post_title ASC";
+
+    $orderby = "exact_match DESC, token_score DESC, relevance DESC, {$wpdb->posts}.post_title ASC";
     return $orderby;
 }
 add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
