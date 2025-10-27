@@ -13,6 +13,83 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+if ( ! function_exists( 'woo_search_opt_log' ) ) {
+    function woo_search_opt_log( $message, $context = array() ) {
+        if ( ! defined( 'WOO_SEARCH_OPT_DEBUG' ) || ! WOO_SEARCH_OPT_DEBUG ) {
+            return;
+        }
+
+        $log_message = $message;
+
+        if ( ! empty( $context ) ) {
+            $encoded_context = wp_json_encode( $context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+
+            if ( false === $encoded_context || null === $encoded_context ) {
+                $encoded_context = print_r( $context, true );
+            }
+
+            $log_message .= ' ' . $encoded_context;
+        }
+
+        error_log( $log_message );
+    }
+}
+
+if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
+    function woo_search_opt_log_query( WP_Query $query ) {
+        if ( is_admin() ) {
+            return;
+        }
+
+        $post_type = $query->get( 'post_type' );
+        $has_product_post_type = ( is_array( $post_type ) && in_array( 'product', $post_type, true ) ) || ( 'product' === $post_type );
+
+        $tax_query = $query->get( 'tax_query' );
+        $has_product_visibility_tax = false;
+
+        if ( is_array( $tax_query ) ) {
+            $stack = $tax_query;
+
+            while ( ! empty( $stack ) ) {
+                $item = array_pop( $stack );
+
+                if ( ! is_array( $item ) ) {
+                    continue;
+                }
+
+                if ( isset( $item['taxonomy'] ) && 'product_visibility' === $item['taxonomy'] ) {
+                    $has_product_visibility_tax = true;
+                    break;
+                }
+
+                foreach ( $item as $value ) {
+                    if ( is_array( $value ) ) {
+                        $stack[] = $value;
+                    }
+                }
+            }
+        }
+
+        if ( ! $has_product_post_type && ! $has_product_visibility_tax ) {
+            return;
+        }
+
+        $context = array(
+            'is_main_query' => $query->is_main_query(),
+            'post_type' => $post_type,
+            'query_s' => $query->get( 's' ),
+            'get_s' => isset( $_GET['s'] ) ? wp_unslash( $_GET['s'] ) : null,
+            'request_s' => isset( $_REQUEST['s'] ) ? wp_unslash( $_REQUEST['s'] ) : null,
+            'query_orderby' => $query->get( 'orderby' ),
+            'get_orderby' => isset( $_GET['orderby'] ) ? wp_unslash( $_GET['orderby'] ) : null,
+            'woo_search_opt_active' => $query->get( 'woo_search_opt_active' ),
+        );
+
+        woo_search_opt_log( 'woo_search_opt pre_get_posts', $context );
+    }
+}
+add_action( 'pre_get_posts', 'woo_search_opt_log_query', 19, 1 );
+
 /**
  * Add JOINs for _price, _sku, and aggregated product attributes.
  * Unique alias names are used to avoid conflicts.
@@ -59,6 +136,11 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
 
     $search_term = $wp_query->get('s');
     $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    woo_search_opt_log( 'woo_search_opt_posts_search', array(
+        'search_phrase' => $search_phrase,
+        'orderby' => $wp_query->get( 'orderby' ),
+        'is_main_query' => $wp_query->is_main_query(),
+    ) );
     if ( '' === $search_phrase ) {
         return $search;
     }
@@ -129,6 +211,11 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
 
     $search_term = $wp_query->get('s');
     $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    woo_search_opt_log( 'woo_search_opt_relevance', array(
+        'search_phrase' => $search_phrase,
+        'orderby' => $wp_query->get( 'orderby' ),
+        'is_main_query' => $wp_query->is_main_query(),
+    ) );
     if ( '' === $search_phrase ) {
         return $fields;
     }
@@ -264,6 +351,11 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
 
     $search_term = $wp_query->get('s');
     $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    woo_search_opt_log( 'woo_search_opt_orderby', array(
+        'search_phrase' => $search_phrase,
+        'orderby' => $wp_query->get( 'orderby' ),
+        'is_main_query' => $wp_query->is_main_query(),
+    ) );
     if ( '' === $search_phrase ) {
         return $orderby;
     }
@@ -278,6 +370,13 @@ add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
  */
 function woo_search_opt_groupby( $groupby, $wp_query ) {
     global $wpdb;
+    $search_term = $wp_query->get('s');
+    $search_phrase = is_string( $search_term ) ? trim( $search_term ) : '';
+    woo_search_opt_log( 'woo_search_opt_groupby', array(
+        'search_phrase' => $search_phrase,
+        'orderby' => $wp_query->get( 'orderby' ),
+        'is_main_query' => $wp_query->is_main_query(),
+    ) );
     $groupby = "{$wpdb->posts}.ID";
     return $groupby;
 }
