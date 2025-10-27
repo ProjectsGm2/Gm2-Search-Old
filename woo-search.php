@@ -37,7 +37,11 @@ if ( ! function_exists( 'woo_search_opt_log' ) ) {
 
 if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
     function woo_search_opt_log_query( WP_Query $query ) {
-        if ( is_admin() && ! ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) ) {
+        $is_admin_request     = is_admin();
+        $is_elementor_ajax    = isset( $_REQUEST['elementor_ajax'] );
+        $is_standard_wp_ajax  = function_exists( 'wp_doing_ajax' ) && wp_doing_ajax();
+
+        if ( $is_admin_request && ! ( $is_standard_wp_ajax || $is_elementor_ajax ) ) {
             return;
         }
 
@@ -76,6 +80,7 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
 
         $context = array(
             'is_main_query' => $query->is_main_query(),
+            'is_admin' => $is_admin_request,
             'post_type' => $post_type,
             'query_s' => $query->get( 's' ),
             'get_s' => isset( $_GET['s'] ) ? wp_unslash( $_GET['s'] ) : null,
@@ -83,6 +88,8 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
             'query_orderby' => $query->get( 'orderby' ),
             'get_orderby' => isset( $_GET['orderby'] ) ? wp_unslash( $_GET['orderby'] ) : null,
             'woo_search_opt_active' => $query->get( 'woo_search_opt_active' ),
+            'request_elementor_ajax' => $is_elementor_ajax ? wp_unslash( $_REQUEST['elementor_ajax'] ) : null,
+            'request_action' => isset( $_REQUEST['action'] ) ? wp_unslash( $_REQUEST['action'] ) : null,
         );
 
         woo_search_opt_log( 'woo_search_opt pre_get_posts', $context );
