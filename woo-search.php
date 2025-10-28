@@ -2122,6 +2122,12 @@ function woo_search_opt_render_loop_pagination( $query ) {
         $add_args['orderby'] = sanitize_text_field( $orderby );
     }
 
+    // Ensure explicit default sort is carried through pagination on search pages.
+    if ( ( ! isset( $add_args['orderby'] ) || '' === $add_args['orderby'] ) && '' !== $search_phrase ) {
+        // Woo recognizes `relevance` for product searches; this keeps page 2+ aligned with page 1.
+        $add_args['orderby'] = 'relevance';
+    }
+
     $order = $query->get( 'order' );
     if ( is_string( $order ) && '' !== $order ) {
         $add_args['order'] = strtoupper( sanitize_text_field( $order ) );
@@ -2214,6 +2220,16 @@ function woo_search_opt_enqueue_frontend_script() {
     }
 
     wp_enqueue_script( 'jquery' );
+
+    // Best-effort: ensure WC Quantity +/- script is present on product search pages.
+    $should_enqueue_qty = ( function_exists( 'is_search' ) && is_search() );
+    if ( $should_enqueue_qty ) {
+        // If the qty plugin registered a script handle, enqueue it here.
+        // Common handle name used by the plugin; harmless if unregistered.
+        if ( wp_script_is( 'wc-quantity-plus-minus-button', 'registered' ) && ! wp_script_is( 'wc-quantity-plus-minus-button', 'enqueued' ) ) {
+            wp_enqueue_script( 'wc-quantity-plus-minus-button' );
+        }
+    }
 
     $script = <<<'JS'
 (function($){
@@ -2383,6 +2399,31 @@ function woo_search_opt_enqueue_frontend_script() {
                 settings.data.s = term;
             }
         });
+
+        // --- Qty +/- compatibility (non-fatal if plugin absent) ---
+        function reinitQtyButtons(context) {
+            try {
+                context = context || document;
+
+                // Known patterns used by qty plugins:
+                if (typeof window.wcqib_refresh === 'function') {
+                    window.wcqib_refresh();
+                }
+                if (jQuery.fn && typeof jQuery.fn.wcqib_refresh === 'function') {
+                    jQuery(context).find('.quantity').wcqib_refresh();
+                }
+
+                // Generic nudge events some plugins listen to:
+                jQuery(document).trigger('qib_refresh');
+                jQuery(document).trigger('wc_quantity_plus_minus_refresh');
+            } catch (e) {
+                // No-op: compatibility only.
+            }
+        }
+
+        // Run on first paint and after Woo updates fragments.
+        reinitQtyButtons(document);
+        jQuery(document).on('updated_wc_div', function(){ reinitQtyButtons(document); });
     });
 })(jQuery);
 JS;
