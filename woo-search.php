@@ -1003,7 +1003,27 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
             return;
         }
 
+        $pagination_adjusted = false;
+
+        if ( '' !== $resolved_search && woo_search_opt_is_product_query( $query ) ) {
+            $no_found_rows = $query->get( 'no_found_rows' );
+
+            if ( $no_found_rows ) {
+                $query->set( 'no_found_rows', false );
+                $pagination_adjusted                = true;
+                $context['no_found_rows_overridden'] = array(
+                    'previous' => woo_search_opt_normalize_context_value( $no_found_rows ),
+                    'current'  => false,
+                );
+            }
+        }
+
         $context['decision'] = 'target_query';
+
+        if ( $pagination_adjusted ) {
+            $context['pagination_adjusted'] = true;
+        }
+
         woo_search_opt_log( 'woo_search_opt pre_get_posts target', $context );
     }
 }
