@@ -312,12 +312,6 @@ function woo_search_opt_normalize_request_payload_to_array( $value ) {
             return $decoded;
         }
 
-        $maybe_unserialized = maybe_unserialize( $value );
-
-        if ( is_array( $maybe_unserialized ) ) {
-            return $maybe_unserialized;
-        }
-
         $parsed = array();
         parse_str( $value, $parsed );
 
