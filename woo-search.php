@@ -330,15 +330,15 @@ function woo_search_opt_normalize_request_payload_to_array( $value ) {
 }
 
 /**
- * Recursively search a payload for the first non-empty search phrase.
+ * Recursively search a payload for the first non-empty scalar value matching the provided keys.
  *
  * @param mixed $payload Payload data to inspect.
- * @param array $keys    Search term keys to inspect.
+ * @param array $keys    Keys to inspect.
  * @param int   $depth   Current recursion depth.
  *
  * @return string
  */
-function woo_search_opt_find_search_term_in_payload( $payload, array $keys, $depth = 0 ) {
+function woo_search_opt_find_scalar_in_payload( $payload, array $keys, $depth = 0 ) {
     if ( $depth > 6 ) {
         return '';
     }
@@ -381,7 +381,7 @@ function woo_search_opt_find_search_term_in_payload( $payload, array $keys, $dep
             continue;
         }
 
-        $nested = woo_search_opt_find_search_term_in_payload( $value, $keys, $depth + 1 );
+        $nested = woo_search_opt_find_scalar_in_payload( $value, $keys, $depth + 1 );
 
         if ( '' !== $nested ) {
             return $nested;
@@ -389,6 +389,19 @@ function woo_search_opt_find_search_term_in_payload( $payload, array $keys, $dep
     }
 
     return '';
+}
+
+/**
+ * Recursively search a payload for the first non-empty search phrase.
+ *
+ * @param mixed $payload Payload data to inspect.
+ * @param array $keys    Search term keys to inspect.
+ * @param int   $depth   Current recursion depth.
+ *
+ * @return string
+ */
+function woo_search_opt_find_search_term_in_payload( $payload, array $keys, $depth = 0 ) {
+    return woo_search_opt_find_scalar_in_payload( $payload, $keys, $depth );
 }
 
 /**
@@ -446,6 +459,57 @@ function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
         }
 
         $value = woo_search_opt_find_search_term_in_payload( $payload, $request_keys );
+
+        if ( '' !== $value ) {
+            return $value;
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Resolve the first scalar value matching the provided keys from the current request payload.
+ *
+ * @param array $keys Keys to inspect within the request payloads.
+ *
+ * @return string
+ */
+function woo_search_opt_resolve_request_scalar( array $keys ) {
+    foreach ( $keys as $key ) {
+        if ( ! isset( $_REQUEST[ $key ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+            continue;
+        }
+
+        $value = $_REQUEST[ $key ]; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+
+        if ( is_array( $value ) || is_object( $value ) ) {
+            $value = woo_search_opt_normalize_request_payload_to_array( $value );
+            $value = woo_search_opt_find_scalar_in_payload( $value, $keys );
+        } else {
+            $value = sanitize_text_field( wp_unslash( $value ) );
+            $value = trim( $value );
+        }
+
+        if ( is_string( $value ) && '' !== $value ) {
+            return $value;
+        }
+    }
+
+    $payload_keys = array( 'query_vars', 'query', 'queryArgs', 'query_args', 'form_data', 'data' );
+
+    foreach ( $payload_keys as $payload_key ) {
+        if ( ! isset( $_REQUEST[ $payload_key ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+            continue;
+        }
+
+        $payload = woo_search_opt_normalize_request_payload_to_array( $_REQUEST[ $payload_key ] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+
+        if ( empty( $payload ) ) {
+            continue;
+        }
+
+        $value = woo_search_opt_find_scalar_in_payload( $payload, $keys );
 
         if ( '' !== $value ) {
             return $value;
@@ -524,13 +588,9 @@ function woo_search_opt_add_orderby_token( array &$tokens, $token, &$primary_ord
  * @return string Normalized request token or empty string when absent.
  */
 function woo_search_opt_get_requested_orderby() {
-    if ( ! isset( $_REQUEST['orderby'] ) ) {
-        return '';
-    }
+    $requested = woo_search_opt_resolve_request_scalar( array( 'orderby' ) );
 
-    $requested = sanitize_text_field( wp_unslash( $_REQUEST['orderby'] ) );
-
-    if ( ! is_string( $requested ) ) {
+    if ( '' === $requested ) {
         return '';
     }
 
@@ -560,6 +620,27 @@ function woo_search_opt_get_requested_orderby() {
     }
 
     return $requested;
+}
+
+/**
+ * Resolve the requested pagination page from the current request payloads.
+ *
+ * @return int
+ */
+function woo_search_opt_get_requested_paged() {
+    $value = woo_search_opt_resolve_request_scalar( array( 'paged', 'page', 'current_page' ) );
+
+    if ( '' === $value ) {
+        return 0;
+    }
+
+    if ( is_numeric( $value ) ) {
+        $value = absint( $value );
+
+        return ( $value > 0 ) ? $value : 0;
+    }
+
+    return 0;
 }
 
 /**
@@ -947,7 +1028,7 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
 
         $context = array(
             'flags'                => woo_search_opt_extract_query_flags( $query ),
-            'request_vars'         => woo_search_opt_collect_request_vars( array( 's', 'gm2_search_term', 'post_type', 'orderby', 'order', 'elementor_ajax', 'action' ) ),
+            'request_vars'         => woo_search_opt_collect_request_vars( array( 's', 'gm2_search_term', 'post_type', 'orderby', 'order', 'paged', 'page', 'elementor_ajax', 'action' ) ),
             'tax_query'            => woo_search_opt_normalize_context_value( $query->get( 'tax_query' ) ),
             'product_visibility'   => false,
             'decision'             => 'pending',
@@ -1003,25 +1084,107 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
             return;
         }
 
-        $pagination_adjusted = false;
+        $no_found_rows_adjusted = false;
+        $requested_paged        = 0;
+        $current_paged          = 0;
+        $resolved_paged         = 0;
+        $paged_overridden       = array();
+        $orderby_overridden     = array();
+        $order_overridden       = array();
 
         if ( '' !== $resolved_search && woo_search_opt_is_product_query( $query ) ) {
             $no_found_rows = $query->get( 'no_found_rows' );
 
             if ( $no_found_rows ) {
                 $query->set( 'no_found_rows', false );
-                $pagination_adjusted                = true;
+                $no_found_rows_adjusted             = true;
                 $context['no_found_rows_overridden'] = array(
                     'previous' => woo_search_opt_normalize_context_value( $no_found_rows ),
                     'current'  => false,
                 );
             }
+
+            $requested_paged = woo_search_opt_get_requested_paged();
+            $current_paged   = absint( $query->get( 'paged' ) );
+            $resolved_paged  = $current_paged;
+
+            if ( $requested_paged > 0 ) {
+                $resolved_paged = $requested_paged;
+            } elseif ( $current_paged < 1 ) {
+                $resolved_paged = 1;
+            }
+
+            if ( $resolved_paged < 1 ) {
+                $resolved_paged = 1;
+            }
+
+            if ( $resolved_paged !== $current_paged ) {
+                $query->set( 'paged', $resolved_paged );
+                $paged_overridden = array(
+                    'previous'  => woo_search_opt_normalize_context_value( $current_paged ),
+                    'current'   => woo_search_opt_normalize_context_value( $resolved_paged ),
+                    'requested' => woo_search_opt_normalize_context_value( $requested_paged ),
+                );
+            }
+
+            $query->set( 'woo_search_opt_enable_pagination', true );
+            $query->set( 'woo_search_opt_resolved_paged', $resolved_paged );
+
+            $requested_orderby = woo_search_opt_get_requested_orderby();
+
+            if ( '' !== $requested_orderby ) {
+                $previous_orderby = $query->get( 'orderby' );
+
+                if ( $previous_orderby !== $requested_orderby ) {
+                    $query->set( 'orderby', $requested_orderby );
+                    $orderby_overridden = array(
+                        'previous' => woo_search_opt_normalize_context_value( $previous_orderby ),
+                        'current'  => woo_search_opt_sanitize_scalar_for_logging( $requested_orderby ),
+                    );
+                }
+            }
+
+            $requested_order  = woo_search_opt_resolve_request_scalar( array( 'order', 'direction' ) );
+            $normalized_order = woo_search_opt_normalize_order_direction( $requested_order );
+
+            if ( '' !== $normalized_order ) {
+                $previous_order = $query->get( 'order' );
+                $upper_order    = strtoupper( $normalized_order );
+
+                if ( ! is_string( $previous_order ) || strtoupper( $previous_order ) !== $upper_order ) {
+                    $query->set( 'order', $upper_order );
+                    $order_overridden = array(
+                        'previous' => woo_search_opt_sanitize_scalar_for_logging( $previous_order ),
+                        'current'  => woo_search_opt_sanitize_scalar_for_logging( $upper_order ),
+                    );
+                }
+            }
+
+            $context['resolved_paged'] = woo_search_opt_normalize_context_value(
+                array(
+                    'requested' => $requested_paged,
+                    'previous'  => $current_paged,
+                    'current'   => $resolved_paged,
+                )
+            );
+
+            if ( ! empty( $orderby_overridden ) ) {
+                $context['orderby_overridden'] = $orderby_overridden;
+            }
+
+            if ( ! empty( $order_overridden ) ) {
+                $context['order_overridden'] = $order_overridden;
+            }
         }
 
         $context['decision'] = 'target_query';
 
-        if ( $pagination_adjusted ) {
+        if ( $no_found_rows_adjusted || ! empty( $paged_overridden ) ) {
             $context['pagination_adjusted'] = true;
+        }
+
+        if ( ! empty( $paged_overridden ) ) {
+            $context['paged_overridden'] = $paged_overridden;
         }
 
         woo_search_opt_log( 'woo_search_opt pre_get_posts target', $context );
@@ -1711,6 +1874,93 @@ function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
     return $posts;
 }
 add_filter( 'posts_results', 'woo_search_opt_posts_results_logger', 20, 2 );
+
+/**
+ * Render pagination links for Elementor-powered product search loops.
+ *
+ * @param WP_Query $query Query instance provided by the loop_end action.
+ *
+ * @return void
+ */
+function woo_search_opt_render_loop_pagination( $query ) {
+    if ( ! ( $query instanceof WP_Query ) ) {
+        return;
+    }
+
+    if ( $query->get( 'woo_search_opt_pagination_rendered' ) ) {
+        return;
+    }
+
+    if ( ! $query->get( 'woo_search_opt_enable_pagination' ) ) {
+        return;
+    }
+
+    $total_pages = (int) $query->max_num_pages;
+
+    if ( $total_pages < 2 ) {
+        return;
+    }
+
+    $current_page = $query->get( 'woo_search_opt_resolved_paged' );
+
+    if ( ! is_numeric( $current_page ) || (int) $current_page < 1 ) {
+        $current_page = absint( $query->get( 'paged' ) );
+    }
+
+    if ( $current_page < 1 ) {
+        $current_page = max( 1, absint( get_query_var( 'paged' ) ) );
+    }
+
+    if ( $current_page < 1 ) {
+        $current_page = 1;
+    }
+
+    $search_phrase = woo_search_opt_resolve_search_phrase( $query );
+    $add_args      = array();
+
+    if ( '' !== $search_phrase ) {
+        $add_args['s']               = sanitize_text_field( $search_phrase );
+        $add_args['gm2_search_term'] = sanitize_text_field( $search_phrase );
+    }
+
+    $orderby = $query->get( 'orderby' );
+    if ( is_string( $orderby ) && '' !== $orderby ) {
+        $add_args['orderby'] = sanitize_text_field( $orderby );
+    }
+
+    $order = $query->get( 'order' );
+    if ( is_string( $order ) && '' !== $order ) {
+        $add_args['order'] = strtoupper( sanitize_text_field( $order ) );
+    }
+
+    $add_args = array_filter( $add_args, 'strlen' );
+
+    $big       = 999999999;
+    $base_link = str_replace( $big, '%#%', esc_url( get_pagenum_link( $big ) ) );
+
+    $pagination = paginate_links(
+        array(
+            'base'      => $base_link,
+            'format'    => '',
+            'current'   => max( 1, (int) $current_page ),
+            'total'     => $total_pages,
+            'type'      => 'list',
+            'mid_size'  => 1,
+            'add_args'  => empty( $add_args ) ? false : $add_args,
+        )
+    );
+
+    if ( empty( $pagination ) ) {
+        return;
+    }
+
+    echo '<nav class="woo-search-opt-pagination" aria-label="' . esc_attr__( 'Products navigation', 'woo-search-optimized' ) . '">';
+    echo $pagination; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- paginate_links() returns safe HTML.
+    echo '</nav>';
+
+    $query->set( 'woo_search_opt_pagination_rendered', true );
+}
+add_action( 'loop_end', 'woo_search_opt_render_loop_pagination' );
 
 /**
  * Enqueue an inline helper script to persist the latest search phrase through AJAX sorters.
