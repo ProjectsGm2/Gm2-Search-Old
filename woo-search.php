@@ -284,6 +284,112 @@ function woo_search_opt_collect_request_vars( $keys = null ) {
 }
 
 /**
+ * Determine whether a query represents a product catalog loop initiated by Elementor.
+ *
+ * Elementor often boots product result widgets through AJAX requests that omit the
+ * `s` parameter, which means our search helpers would normally treat the query as
+ * an empty search and bail before applying JOIN/GROUP BY tweaks required for
+ * pagination and relevance metadata. This helper inspects the query alongside
+ * current request globals to spot those Elementor catalog loops.
+ *
+ * @param WP_Query $query Query instance.
+ *
+ * @return bool True when the query behaves like an Elementor product catalog loop.
+ */
+function woo_search_opt_is_product_catalog_query( $query ) {
+    if ( ! ( $query instanceof WP_Query ) ) {
+        return false;
+    }
+
+    $post_type             = $query->get( 'post_type' );
+    $has_product_post_type = false;
+
+    if ( is_array( $post_type ) ) {
+        foreach ( $post_type as $type ) {
+            if ( 'product' === $type ) {
+                $has_product_post_type = true;
+                break;
+            }
+        }
+    } elseif ( is_string( $post_type ) && 'product' === $post_type ) {
+        $has_product_post_type = true;
+    }
+
+    $tax_query              = $query->get( 'tax_query' );
+    $has_product_tax_filter = false;
+
+    if ( is_array( $tax_query ) ) {
+        $stack = $tax_query;
+
+        while ( ! empty( $stack ) ) {
+            $item = array_pop( $stack );
+
+            if ( ! is_array( $item ) ) {
+                continue;
+            }
+
+            if ( isset( $item['taxonomy'] ) && in_array( $item['taxonomy'], array( 'product_cat', 'product_visibility' ), true ) ) {
+                $has_product_tax_filter = true;
+                break;
+            }
+
+            foreach ( $item as $value ) {
+                if ( is_array( $value ) ) {
+                    $stack[] = $value;
+                }
+            }
+        }
+    }
+
+    if ( ! $has_product_post_type && ! $has_product_tax_filter ) {
+        return false;
+    }
+
+    $request_action       = '';
+    if ( isset( $_REQUEST['action'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        $raw_action = wp_unslash( $_REQUEST['action'] );
+        if ( is_scalar( $raw_action ) ) {
+            $request_action = sanitize_text_field( (string) $raw_action );
+        }
+    }
+
+    $request_wc_ajax = '';
+    if ( isset( $_REQUEST['wc-ajax'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        $raw_wc_ajax = wp_unslash( $_REQUEST['wc-ajax'] );
+        if ( is_scalar( $raw_wc_ajax ) ) {
+            $request_wc_ajax = sanitize_text_field( (string) $raw_wc_ajax );
+        }
+    }
+    $elementor_ajax_flag  = ! empty( $_REQUEST['elementor_ajax'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+    $elementor_query_id   = $query->get( 'elementor_query_id' );
+    $elementor_widget_id  = $query->get( 'elementor_widget_id' );
+    $elementor_source     = $query->get( 'elementor_source' );
+    $elementor_request_id = '';
+    if ( isset( $_REQUEST['elementor_query_id'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        $raw_query_id = wp_unslash( $_REQUEST['elementor_query_id'] );
+        if ( is_scalar( $raw_query_id ) ) {
+            $elementor_request_id = sanitize_text_field( (string) $raw_query_id );
+        }
+    }
+
+    $ajax_actions = array( 'get_refreshed_fragments', 'elementor_menu_cart_fragments' );
+
+    $has_elementor_marker = $elementor_ajax_flag
+        || ( '' !== $request_wc_ajax && in_array( $request_wc_ajax, $ajax_actions, true ) )
+        || ( '' !== $request_action && false !== strpos( $request_action, 'elementor' ) )
+        || ( is_string( $elementor_query_id ) && '' !== $elementor_query_id )
+        || ( is_string( $elementor_widget_id ) && '' !== $elementor_widget_id )
+        || ( is_string( $elementor_source ) && '' !== $elementor_source )
+        || ( '' !== $elementor_request_id );
+
+    if ( ! $has_elementor_marker ) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
  * Resolve the active search phrase for the current query or request context.
  *
  * @param WP_Query|null $wp_query Optional query instance to inspect.
@@ -805,8 +911,10 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
         $resolved_search       = woo_search_opt_resolve_search_phrase( $query );
         $resolved_search_safe  = woo_search_opt_sanitize_scalar_for_logging( $resolved_search );
         $sort_diagnostics      = woo_search_opt_collect_sort_diagnostics( $query );
-        $request_action        = isset( $_REQUEST['action'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['action'] ) ) : '';
+        $raw_request_action    = isset( $_REQUEST['action'] ) ? wp_unslash( $_REQUEST['action'] ) : null; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        $request_action        = is_scalar( $raw_request_action ) ? sanitize_text_field( (string) $raw_request_action ) : '';
         $search_term_injected  = false;
+        $is_elementor_catalog  = woo_search_opt_is_product_catalog_query( $query );
 
         if ( 'gm2_filter_products' === $request_action && '' !== $resolved_search ) {
             $query_search = $query->get( 's' );
@@ -827,6 +935,7 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
             'wp_ajax'              => $is_standard_wp_ajax,
             'resolved_search'      => $resolved_search_safe,
             'search_term_injected' => $search_term_injected,
+            'elementor_product_loop' => $is_elementor_catalog,
         );
 
         $context = woo_search_opt_append_sort_context( $context, $query, $sort_diagnostics );
@@ -869,7 +978,7 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
         $context['product_visibility'] = $has_product_visibility_tax;
         $context['flags']['post_type'] = woo_search_opt_normalize_context_value( $post_type );
 
-        if ( ! $has_product_post_type && ! $has_product_visibility_tax ) {
+        if ( ! $has_product_post_type && ! $has_product_visibility_tax && ! $is_elementor_catalog ) {
             $context['decision'] = 'bail_non_product_query';
             woo_search_opt_log( 'woo_search_opt pre_get_posts bail', $context );
             return;
@@ -919,15 +1028,18 @@ function woo_search_opt_joins( $join, $wp_query ) {
     }
 
     $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $is_elementor_catalog = woo_search_opt_is_product_catalog_query( $wp_query );
 
     if ( '' === $sort_token ) {
         $sort_token = $sort_diagnostics['token'];
     }
-    if ( '' === $search_phrase ) {
+    // Elementor product loops omit the search term; only bail on truly empty catalog queries.
+    if ( '' === $search_phrase && ! $is_elementor_catalog ) {
         $context = array(
             'reason'          => 'empty_search',
             'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
             'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
+            'elementor_product_loop' => $is_elementor_catalog,
         );
         $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
         woo_search_opt_log( 'woo_search_opt posts_join bail', $context );
@@ -942,6 +1054,7 @@ function woo_search_opt_joins( $join, $wp_query ) {
             'reason'     => 'non_product_query',
             'flags'      => woo_search_opt_extract_query_flags( $wp_query ),
             'post_types' => woo_search_opt_normalize_context_value( $post_types ),
+            'elementor_product_loop' => $is_elementor_catalog,
         );
         $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
         woo_search_opt_log( 'woo_search_opt posts_join bail', $context );
@@ -991,6 +1104,7 @@ function woo_search_opt_joins( $join, $wp_query ) {
         'outgoing_join'  => woo_search_opt_truncate_for_logging( $join ),
         'attribute_join' => 'pa_% taxonomy aggregation',
         'sort_joins'     => woo_search_opt_sanitize_array_for_logging( $added_joins ),
+        'elementor_product_loop' => $is_elementor_catalog,
     );
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
 
@@ -1026,15 +1140,25 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
     if ( '' === $sort_token ) {
         $sort_token = $sort_diagnostics['token'];
     }
+    $is_elementor_catalog = woo_search_opt_is_product_catalog_query( $wp_query );
+
     $context = array(
         'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
         'incoming_search' => woo_search_opt_truncate_for_logging( $search ),
         'search_phrase'   => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'        => 'pending',
+        'elementor_product_loop' => $is_elementor_catalog,
     );
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
+        if ( $is_elementor_catalog ) {
+            // Elementor product loops omit the search term; leave the search clause untouched but allow downstream hooks.
+            $context['decision'] = 'pass_through_catalog';
+            woo_search_opt_log( 'woo_search_opt posts_search passthrough', $context );
+            return $search;
+        }
+
         $context['decision'] = 'bail_empty_search';
         woo_search_opt_log( 'woo_search_opt posts_search bail', $context );
         return $search;
@@ -1309,6 +1433,7 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
     }
 
     $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $is_elementor_catalog = woo_search_opt_is_product_catalog_query( $wp_query );
 
     if ( '' === $sort_token ) {
         $sort_token = $sort_diagnostics['token'];
@@ -1319,9 +1444,10 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
         'incoming_orderby'  => woo_search_opt_truncate_for_logging( $orderby ),
         'resolved_search'   => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'          => 'pending',
+        'elementor_product_loop' => $is_elementor_catalog,
     );
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
-    if ( '' === $search_phrase ) {
+    if ( '' === $search_phrase && ! $is_elementor_catalog ) {
         $context['decision'] = 'bail_empty_search';
         woo_search_opt_log( 'woo_search_opt posts_orderby bail', $context );
         return $orderby;
@@ -1356,6 +1482,14 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
         }
     }
 
+    if ( '' === $search_phrase && $is_elementor_catalog ) {
+        // Elementor catalog requests without a search phrase should retain Elementor's default ordering.
+        $context['decision']         = 'pass_through_catalog';
+        $context['outgoing_orderby'] = woo_search_opt_truncate_for_logging( $orderby );
+        woo_search_opt_log( 'woo_search_opt posts_orderby passthrough', $context );
+        return $orderby;
+    }
+
     $orderby = "title_exact_phrase DESC, title_ordered_phrase DESC, title_all_tokens DESC, title_token_hits DESC, attr_all_tokens DESC, content_all_tokens DESC, overall_token_hits DESC, token_score DESC, relevance DESC, {$wpdb->posts}.post_title ASC";
     $context['decision']        = 'applied';
     $context['outgoing_orderby'] = woo_search_opt_truncate_for_logging( $orderby );
@@ -1369,6 +1503,7 @@ add_filter('posts_orderby', 'woo_search_opt_orderby', 20, 2);
  * - Perform a product search without touching the sort dropdown and confirm the logs show an empty resolved_sort with no requested_orderby value while relevance ordering remains active.
  * - Exercise each sort dropdown option (popularity, rating, latest, price low→high, price high→low, random) and confirm the logs capture both requested_orderby and resolved_sort tokens alongside matching UI results and ORDER BY clauses.
  * - Repeat the sort dropdown without a search term to ensure default catalog ordering remains unchanged.
+ * - Elementor results widget paginates without using the sort dropdown, covering initial loads and wc-ajax=get_refreshed_fragments / admin-ajax.php refreshes.
  * - Watch for SQL errors in the debug log and confirm relevance ordering is still applied when no explicit sort is chosen.
  */
 
@@ -1379,18 +1514,23 @@ function woo_search_opt_groupby( $groupby, $wp_query ) {
     global $wpdb;
     $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
     $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $is_elementor_catalog = woo_search_opt_is_product_catalog_query( $wp_query );
     $context = array(
         'flags'            => woo_search_opt_extract_query_flags( $wp_query ),
         'search_phrase'    => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'incoming_groupby' => woo_search_opt_truncate_for_logging( $groupby ),
         'resolved_search'  => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
         'decision'         => 'pending',
+        'elementor_product_loop' => $is_elementor_catalog,
     );
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
-        $context['decision'] = 'bail_empty_search';
-        woo_search_opt_log( 'woo_search_opt posts_groupby bail', $context );
-        return $groupby;
+        // Elementor product loops omit the search term; keep GROUP BY enforcement for pagination integrity.
+        if ( ! $is_elementor_catalog ) {
+            $context['decision'] = 'bail_empty_search';
+            woo_search_opt_log( 'woo_search_opt posts_groupby bail', $context );
+            return $groupby;
+        }
     }
     $groupby = "{$wpdb->posts}.ID";
     $context['decision']         = 'applied';
@@ -1411,12 +1551,15 @@ add_filter('posts_groupby', 'woo_search_opt_groupby', 20, 2);
 function woo_search_opt_posts_clauses_logger( $clauses, $wp_query ) {
     $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
     $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $is_elementor_catalog = woo_search_opt_is_product_catalog_query( $wp_query );
 
-    if ( '' === $search_phrase ) {
+    // Elementor product loops omit the search term; only skip logging when the empty search is unrelated.
+    if ( '' === $search_phrase && ! $is_elementor_catalog ) {
         $context = array(
             'reason'          => 'empty_search',
             'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
             'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
+            'elementor_product_loop' => $is_elementor_catalog,
         );
         $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
         woo_search_opt_log( 'woo_search_opt posts_clauses bail', $context );
@@ -1435,6 +1578,7 @@ function woo_search_opt_posts_clauses_logger( $clauses, $wp_query ) {
         'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
         'clauses'         => $clause_snapshot,
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
+        'elementor_product_loop' => $is_elementor_catalog,
     );
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
 
@@ -1455,12 +1599,15 @@ add_filter( 'posts_clauses', 'woo_search_opt_posts_clauses_logger', 20, 2 );
 function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
     $search_phrase    = woo_search_opt_resolve_search_phrase( $wp_query );
     $sort_diagnostics = woo_search_opt_collect_sort_diagnostics( $wp_query );
+    $is_elementor_catalog = woo_search_opt_is_product_catalog_query( $wp_query );
 
-    if ( '' === $search_phrase ) {
+    // Elementor product loops omit the search term; continue logging so pagination snapshots include JOIN-derived metadata.
+    if ( '' === $search_phrase && ! $is_elementor_catalog ) {
         $context = array(
             'reason'          => 'empty_search',
             'flags'           => woo_search_opt_extract_query_flags( $wp_query ),
             'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
+            'elementor_product_loop' => $is_elementor_catalog,
         );
         $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
         woo_search_opt_log( 'woo_search_opt posts_results bail', $context );
@@ -1505,6 +1652,7 @@ function woo_search_opt_posts_results_logger( $posts, $wp_query ) {
         'logged_results'  => $summary,
         'truncated'       => count( $posts ) > $max_results,
         'resolved_search' => woo_search_opt_sanitize_scalar_for_logging( $search_phrase ),
+        'elementor_product_loop' => $is_elementor_catalog,
     );
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
 
