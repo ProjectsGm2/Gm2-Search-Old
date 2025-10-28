@@ -1010,6 +1010,33 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
 add_action( 'pre_get_posts', 'woo_search_opt_log_query', 19, 1 );
 
 /**
+ * Determine whether a query targets WooCommerce products.
+ *
+ * @param WP_Query $wp_query Query instance.
+ *
+ * @return bool
+ */
+function woo_search_opt_is_product_query( $wp_query ) {
+    if ( ! ( $wp_query instanceof WP_Query ) ) {
+        return false;
+    }
+
+    $post_types = $wp_query->get( 'post_type' );
+
+    if ( is_array( $post_types ) ) {
+        foreach ( $post_types as $post_type ) {
+            if ( 'product' === $post_type ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    return ( 'product' === $post_types );
+}
+
+/**
  * Check whether the JOIN clause already contains an alias.
  *
  * @param string $join_sql JOIN clause.
@@ -1063,9 +1090,8 @@ function woo_search_opt_joins( $join, $wp_query ) {
     }
 
     // Only modify queries for products.
-    $post_types = $wp_query->get('post_type');
-    if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
-         (!is_array($post_types) && 'product' !== $post_types) ) {
+    if ( ! woo_search_opt_is_product_query( $wp_query ) ) {
+        $post_types = ( $wp_query instanceof WP_Query ) ? $wp_query->get( 'post_type' ) : null;
         $context = array(
             'reason'     => 'non_product_query',
             'flags'      => woo_search_opt_extract_query_flags( $wp_query ),
@@ -1169,9 +1195,8 @@ function woo_search_opt_posts_search( $search, $wp_query ) {
     }
 
     // Only affect product queries.
-    $post_types = $wp_query->get('post_type');
-    if ( (is_array($post_types) && ! in_array('product', $post_types)) ||
-        (!is_array($post_types) && 'product' !== $post_types) ) {
+    if ( ! woo_search_opt_is_product_query( $wp_query ) ) {
+        $post_types = ( $wp_query instanceof WP_Query ) ? $wp_query->get( 'post_type' ) : null;
         $context['decision']   = 'bail_non_product_query';
         $context['post_types'] = woo_search_opt_normalize_context_value( $post_types );
         woo_search_opt_log( 'woo_search_opt posts_search bail', $context );
@@ -1276,6 +1301,14 @@ function woo_search_opt_relevance( $fields, $wp_query ) {
     $context = woo_search_opt_append_sort_context( $context, $wp_query, $sort_diagnostics );
     if ( '' === $search_phrase ) {
         $context['decision'] = 'bail_empty_search';
+        woo_search_opt_log( 'woo_search_opt posts_fields bail', $context );
+        return $fields;
+    }
+
+    if ( ! woo_search_opt_is_product_query( $wp_query ) ) {
+        $post_types = ( $wp_query instanceof WP_Query ) ? $wp_query->get( 'post_type' ) : null;
+        $context['decision']   = 'bail_non_product_query';
+        $context['post_types'] = woo_search_opt_normalize_context_value( $post_types );
         woo_search_opt_log( 'woo_search_opt posts_fields bail', $context );
         return $fields;
     }
@@ -1455,6 +1488,14 @@ function woo_search_opt_orderby( $orderby, $wp_query ) {
         return $orderby;
     }
 
+    if ( ! woo_search_opt_is_product_query( $wp_query ) ) {
+        $post_types = ( $wp_query instanceof WP_Query ) ? $wp_query->get( 'post_type' ) : null;
+        $context['decision']   = 'bail_non_product_query';
+        $context['post_types'] = woo_search_opt_normalize_context_value( $post_types );
+        woo_search_opt_log( 'woo_search_opt posts_orderby bail', $context );
+        return $orderby;
+    }
+
     if ( '' !== $sort_token ) {
         $map = array(
             'price'       => "CAST( woo_pm_price.meta_value AS DECIMAL(10,2) ) ASC",
@@ -1520,6 +1561,15 @@ function woo_search_opt_groupby( $groupby, $wp_query ) {
         woo_search_opt_log( 'woo_search_opt posts_groupby bail', $context );
         return $groupby;
     }
+
+    if ( ! woo_search_opt_is_product_query( $wp_query ) ) {
+        $post_types = ( $wp_query instanceof WP_Query ) ? $wp_query->get( 'post_type' ) : null;
+        $context['decision']   = 'bail_non_product_query';
+        $context['post_types'] = woo_search_opt_normalize_context_value( $post_types );
+        woo_search_opt_log( 'woo_search_opt posts_groupby bail', $context );
+        return $groupby;
+    }
+
     $groupby = "{$wpdb->posts}.ID";
     $context['decision']         = 'applied';
     $context['outgoing_groupby'] = woo_search_opt_truncate_for_logging( $groupby );
