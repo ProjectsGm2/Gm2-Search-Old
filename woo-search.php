@@ -1261,6 +1261,31 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
                 );
             }
 
+            // Ensure paging is enabled for main product searches (avoid "show all" behavior).
+            if ( $query->is_main_query() && $query->is_search() && woo_search_opt_is_product_query( $query ) ) {
+                $ppp    = (int) $query->get( 'posts_per_page' );
+                $nopage = $query->get( 'nopaging' );
+
+                if ( -1 === $ppp || true === $nopage ) {
+                    // Use a sensible per-page value:
+                    // Prefer WordPress default; allow Woo/Theme filters to adjust via 'loop_shop_per_page'.
+                    $default_ppp = (int) get_option( 'posts_per_page' );
+                    if ( $default_ppp < 1 ) {
+                        $default_ppp = 12; // fallback
+                    }
+                    $default_ppp = (int) apply_filters( 'loop_shop_per_page', $default_ppp, $query );
+
+                    $query->set( 'posts_per_page', max( 1, $default_ppp ) );
+                    $query->set( 'nopaging', false );
+
+                    // We already force this elsewhere, but keep it explicit for safety:
+                    $query->set( 'no_found_rows', false );
+
+                    // Flag for diagnostics (optional):
+                    $query->set( 'woo_search_opt_paging_fixed', true );
+                }
+            }
+
             $requested_paged = woo_search_opt_get_requested_paged( $query );
             $current_paged   = absint( $query->get( 'paged' ) );
             $resolved_paged  = $current_paged;
@@ -1275,7 +1300,9 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
                 $resolved_paged = 1;
             }
 
-            if ( $resolved_paged !== $current_paged ) {
+            // Respect existing paged unless the request explicitly asked for a page.
+            // (Elementor/Woo will pass the correct var; we just thread it through.)
+            if ( $requested_paged > 0 && $resolved_paged !== $current_paged ) {
                 $query->set( 'paged', $resolved_paged );
                 $paged_overridden = array(
                     'previous'  => woo_search_opt_normalize_context_value( $current_paged ),
@@ -2041,6 +2068,16 @@ add_filter( 'posts_results', 'woo_search_opt_posts_results_logger', 20, 2 );
  */
 function woo_search_opt_render_loop_pagination( $query ) {
     if ( ! ( $query instanceof WP_Query ) ) {
+        return;
+    }
+
+    // Only for main product search loops, and avoid double pagination with Elementor widgets.
+    if ( ! $query->is_main_query() ) {
+        return;
+    }
+
+    if ( woo_search_opt_is_elementor_context( $query ) ) {
+        // Elementor Products widget will render its own pagination.
         return;
     }
 
