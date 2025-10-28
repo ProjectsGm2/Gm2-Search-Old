@@ -13,6 +13,22 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+// ---- Logger shim (uses existing logger if available) ----
+if ( ! function_exists( 'woo_search_opt_debug' ) ) {
+    function woo_search_opt_debug( $msg, $ctx = array() ) {
+        // Prefer existing plugin logger if defined
+        if ( function_exists( 'woo_search_opt_log' ) ) {
+            woo_search_opt_log( $msg, $ctx );
+            return;
+        }
+        // Fallback to error_log
+        if ( ! empty( $ctx ) ) {
+            $msg .= ' | ' . wp_json_encode( $ctx );
+        }
+        error_log( '[woo-search] ' . $msg );
+    }
+}
+
 /**
  * Initialize the diagnostics logger and ensure the uploads directory exists.
  *
@@ -70,36 +86,94 @@ add_action( 'plugins_loaded', 'woo_search_opt_init_logger' );
 
 // === Woo Search Optimized: force product search & default sort =================
 add_action( 'pre_get_posts', function( $q ) {
-    if ( ! function_exists( 'WC' ) ) {
-        return;
-    }
-
-    if ( ! $q instanceof WP_Query ) {
-        return;
-    }
-
-    if ( ! $q->is_main_query() ) {
-        return;
-    }
-
-    if ( ! $q->is_search() ) {
+    if ( is_admin() || ! ( $q instanceof WP_Query ) || ! $q->is_main_query() || ! $q->is_search() ) {
         return;
     }
 
     $post_type = $q->get( 'post_type' );
     if ( empty( $post_type ) || 'any' === $post_type ) {
         $q->set( 'post_type', 'product' );
+        woo_search_opt_debug( 'pre_get_posts:set_post_type_product' );
     }
 
     if ( ! $q->get( 'wc_query' ) ) {
         $q->set( 'wc_query', 'product_query' );
+        woo_search_opt_debug( 'pre_get_posts:set_wc_query_flag' );
     }
 
     $orderby = (string) $q->get( 'orderby' );
     if ( '' === $orderby ) {
         $q->set( 'orderby', 'relevance' );
+        woo_search_opt_debug( 'pre_get_posts:set_default_orderby', array( 'orderby' => 'relevance' ) );
+    } else {
+        woo_search_opt_debug( 'pre_get_posts:keep_orderby', array( 'orderby' => $orderby ) );
     }
-}, 20 );
+}, 1 );
+
+add_filter( 'woocommerce_default_catalog_orderby', function( $default ) {
+    if ( is_search() ) {
+        woo_search_opt_debug( 'default_catalog_orderby:override_for_search', array( 'default' => 'relevance' ) );
+        return 'relevance';
+    }
+    return $default;
+}, 999 );
+
+// ---- Stable ORDER BY for relevance ----
+add_filter( 'posts_orderby', function( $orderby_sql, $query ) {
+    if ( is_admin() || ! ( $query instanceof WP_Query ) || ! $query->is_main_query() || ! $query->is_search() ) {
+        return $orderby_sql;
+    }
+
+    $pt      = $query->get( 'post_type' );
+    $orderby = (string) $query->get( 'orderby' );
+
+    if ( 'product' !== $pt ) {
+        return $orderby_sql;
+    }
+
+    if ( 'relevance' !== $orderby && '' !== $orderby ) {
+        return $orderby_sql;
+    }
+
+    global $wpdb;
+    $s = (string) $query->get( 's' );
+
+    if ( '' === $s ) {
+        $stable = "{$wpdb->posts}.post_date DESC, {$wpdb->posts}.ID DESC";
+        woo_search_opt_debug( 'posts_orderby:empty_search_fallback', array( 'orderby' => $stable ) );
+        return $stable;
+    }
+
+    $base_orderby = trim( (string) $orderby_sql );
+
+    if ( '' === $base_orderby ) {
+        $like     = '%' . $wpdb->esc_like( $s ) . '%';
+        $like_sql = esc_sql( $like );
+
+        $score_sql =
+            "( (CASE WHEN {$wpdb->posts}.post_title LIKE '{$like_sql}' THEN 2 ELSE 0 END) " .
+            " + (CASE WHEN {$wpdb->posts}.post_content LIKE '{$like_sql}' THEN 1 ELSE 0 END) )";
+
+        $base_orderby = "{$score_sql} DESC";
+    }
+
+    $final = $base_orderby;
+
+    $tie_breakers = array(
+        "{$wpdb->posts}.post_date DESC",
+        "{$wpdb->posts}.ID DESC",
+    );
+
+    foreach ( $tie_breakers as $tie_breaker ) {
+        if ( false === stripos( $final, $tie_breaker ) ) {
+            $final .= ( '' === $final ? '' : ', ' ) . $tie_breaker;
+        }
+    }
+
+    woo_search_opt_debug( 'posts_orderby:relevance', array( 'orderby' => $final ) );
+
+    return $final;
+}, 999, 2 );
 
 /**
  * Sanitize scalar values for logging output.
@@ -2170,6 +2244,29 @@ function woo_search_opt_render_loop_pagination( $query ) {
         $add_args['order'] = sanitize_text_field( $order );
     }
 
+    $pt = get_query_var( 'post_type', '' );
+    if ( $pt ) {
+        if ( is_array( $pt ) ) {
+            $sanitized_types = array_values( array_filter( array_map( 'sanitize_key', $pt ) ) );
+            if ( in_array( 'product', $sanitized_types, true ) ) {
+                $add_args['post_type'] = 'product';
+            } elseif ( ! empty( $sanitized_types ) ) {
+                $add_args['post_type'] = $sanitized_types[0];
+            }
+        } else {
+            $sanitized_type = sanitize_key( $pt );
+            if ( '' !== $sanitized_type ) {
+                $add_args['post_type'] = $sanitized_type;
+            }
+        }
+    }
+
+    if ( get_query_var( 'wc_query', '' ) ) {
+        $add_args['wc_query'] = 'product_query';
+    }
+
+    woo_search_opt_debug( 'paginate_links:add_args', $add_args );
+
     $add_args = array_filter( $add_args, 'strlen' );
 
     $pagination_var = $query->get( 'woo_search_opt_resolved_paged_var' );
@@ -2224,6 +2321,12 @@ function woo_search_opt_render_loop_pagination( $query ) {
         $format    = $format_glue . $pagination_var . '=%#%';
     }
 
+    woo_search_opt_debug( 'paginate_links:before', array(
+        'base'     => isset( $base_link ) ? $base_link : null,
+        'format'   => isset( $format ) ? $format : null,
+        'add_args' => empty( $add_args ) ? array() : $add_args,
+    ) );
+
     $pagination = paginate_links(
         array(
             'base'      => $base_link,
@@ -2264,6 +2367,7 @@ function woo_search_opt_register_best_match_sort( $sorts ) {
 
     if ( ! isset( $sorts['relevance'] ) ) {
         $sorts = array( 'relevance' => $label ) + $sorts;
+        woo_search_opt_debug( 'catalog_orderby:added_relevance_label' );
     } else {
         $sorts['relevance'] = $label;
     }
@@ -2286,11 +2390,12 @@ function woo_search_opt_filter_relevance_ordering_args( $args, $orderby, $order 
         return $args;
     }
 
-    unset( $args['orderby'], $args['meta_key'] );
+    unset( $args['meta_key'] );
 
-    if ( is_string( $order ) && '' !== $order ) {
-        $args['order'] = $order;
-    }
+    $args['orderby'] = 'date';
+    $args['order']   = ( is_string( $order ) && '' !== $order ) ? $order : 'DESC';
+
+    woo_search_opt_debug( 'ordering_args:relevance_token', $args );
 
     return $args;
 }
@@ -2500,8 +2605,11 @@ JS;
         }
 
         if ( $is_product_search ) {
+            woo_search_opt_debug( 'qty:enqueue_on_product_search' );
+
             if ( wp_script_is( 'wc-quantity-plus-minus-button', 'registered' ) && ! wp_script_is( 'wc-quantity-plus-minus-button', 'enqueued' ) ) {
                 wp_enqueue_script( 'wc-quantity-plus-minus-button' );
+                woo_search_opt_debug( 'qty:enqueued_third_party' );
             }
 
             $qty_handle = 'woo-search-qty-compat';
@@ -2512,21 +2620,76 @@ JS;
 
             $qty_script = <<<'JS'
 (function($){
-    function reinitQty(context){
-        try {
-            context = context || document;
-            if (typeof window.wcqib_refresh === 'function') { window.wcqib_refresh(); }
-            if ($.fn && typeof $.fn.wcqib_refresh === 'function') { $(context).find('.quantity').wcqib_refresh(); }
-            $(document).trigger('qib_refresh');
-            $(document).trigger('wc_quantity_plus_minus_refresh');
-        } catch(e) {}
-    }
+    var WSO_QTY = {
+        log: function(evt){
+            try { console.log('[woo-search][qty] ' + evt); } catch(e){}
+        },
+        ensureButtons: function(ctx){
+            var $ctx = $(ctx||document);
+            $ctx.find('.quantity input[type="number"]').each(function(){
+                var $input = $(this);
+                if ($input.data('wso-qfy')) { return; }
+                $input.data('wso-qfy', true);
+                var $wrap = $input.closest('.quantity');
+                if ($wrap.find('.wso-qty-minus').length === 0) {
+                    $('<button type="button" class="wso-qty-minus">-</button>').insertBefore($input);
+                }
+                if ($wrap.find('.wso-qty-plus').length === 0) {
+                    $('<button type="button" class="wso-qty-plus">+</button>').insertAfter($input);
+                }
+            });
+        },
+        bindHandlers: function(ctx){
+            var $ctx = $(ctx||document);
+            $ctx.off('click.wsoQty', '.wso-qty-minus, .wso-qty-plus').on('click.wsoQty', '.wso-qty-minus, .wso-qty-plus', function(e){
+                e.preventDefault();
+                var $btn = $(this);
+                var $qty = $btn.siblings('input[type="number"]');
+                if (!$qty.length) {
+                    $qty = $btn.closest('.quantity').find('input[type="number"]');
+                }
+                var step = parseFloat($qty.attr('step')) || 1;
+                var min = parseFloat($qty.attr('min'));
+                var max = parseFloat($qty.attr('max'));
+                var val = parseFloat($qty.val()) || 0;
+                if ($btn.hasClass('wso-qty-minus')) {
+                    val -= step;
+                } else {
+                    val += step;
+                }
+                if (!isNaN(min)) { val = Math.max(min, val); }
+                if (!isNaN(max)) { val = Math.min(max, val); }
+                $qty.val(val).trigger('change');
+            });
+        },
+        tryThirdParty: function(ctx){
+            try {
+                if (typeof window.wcqib_refresh === 'function') { window.wcqib_refresh(); WSO_QTY.log('third_party:wcqib_refresh'); }
+                if ($.fn && typeof $.fn.wcqib_refresh === 'function') { $(ctx||document).find('.quantity').wcqib_refresh(); WSO_QTY.log('third_party:jQuery_wcqib_refresh'); }
+                $(document).trigger('qib_refresh').trigger('wc_quantity_plus_minus_refresh');
+            } catch(e){}
+        },
+        reinit: function(ctx){
+            WSO_QTY.ensureButtons(ctx);
+            WSO_QTY.bindHandlers(ctx);
+            WSO_QTY.tryThirdParty(ctx);
+        }
+    };
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function(){ reinitQty(document); });
+        document.addEventListener('DOMContentLoaded', function(){ WSO_QTY.reinit(document); WSO_QTY.log('DOMContentLoaded'); });
     } else {
-        reinitQty(document);
+        WSO_QTY.reinit(document);
+        WSO_QTY.log('dom_ready_now');
     }
-    $(document).on('updated_wc_div', function(){ reinitQty(document); });
+
+    $(document)
+        .on('updated_wc_div', function(){ WSO_QTY.reinit(document); WSO_QTY.log('updated_wc_div'); })
+        .on('ajaxComplete', function(){ WSO_QTY.reinit(document); WSO_QTY.log('ajaxComplete'); })
+        .on('woof_ajax_done', function(){ WSO_QTY.reinit(document); WSO_QTY.log('woof_ajax_done'); })
+        .on('yith-wcan-ajax-filtered', function(){ WSO_QTY.reinit(document); WSO_QTY.log('yith-wcan-ajax-filtered'); })
+        .on('gm2_filter_products_done', function(){ WSO_QTY.reinit(document); WSO_QTY.log('gm2_filter_products_done'); });
+
 })(jQuery);
 JS;
 
