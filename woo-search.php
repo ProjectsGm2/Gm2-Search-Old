@@ -284,6 +284,114 @@ function woo_search_opt_collect_request_vars( $keys = null ) {
 }
 
 /**
+ * Normalize a request payload into an associative array for inspection.
+ *
+ * @param mixed $value Raw payload value from the request superglobal.
+ *
+ * @return array
+ */
+function woo_search_opt_normalize_request_payload_to_array( $value ) {
+    if ( is_object( $value ) ) {
+        $value = (array) $value;
+    }
+
+    if ( is_array( $value ) ) {
+        return wp_unslash( $value );
+    }
+
+    if ( is_string( $value ) ) {
+        $value = trim( wp_unslash( $value ) );
+
+        if ( '' === $value ) {
+            return array();
+        }
+
+        $decoded = json_decode( $value, true );
+
+        if ( is_array( $decoded ) ) {
+            return $decoded;
+        }
+
+        $maybe_unserialized = maybe_unserialize( $value );
+
+        if ( is_array( $maybe_unserialized ) ) {
+            return $maybe_unserialized;
+        }
+
+        $parsed = array();
+        parse_str( $value, $parsed );
+
+        if ( is_array( $parsed ) ) {
+            return $parsed;
+        }
+    }
+
+    return array();
+}
+
+/**
+ * Recursively search a payload for the first non-empty search phrase.
+ *
+ * @param mixed $payload Payload data to inspect.
+ * @param array $keys    Search term keys to inspect.
+ * @param int   $depth   Current recursion depth.
+ *
+ * @return string
+ */
+function woo_search_opt_find_search_term_in_payload( $payload, array $keys, $depth = 0 ) {
+    if ( $depth > 6 ) {
+        return '';
+    }
+
+    if ( is_object( $payload ) ) {
+        $payload = (array) $payload;
+    }
+
+    if ( ! is_array( $payload ) ) {
+        return '';
+    }
+
+    foreach ( $keys as $key ) {
+        if ( ! array_key_exists( $key, $payload ) ) {
+            continue;
+        }
+
+        $value = $payload[ $key ];
+
+        if ( is_array( $value ) || is_object( $value ) ) {
+            $nested = woo_search_opt_find_search_term_in_payload( $value, $keys, $depth + 1 );
+
+            if ( '' !== $nested ) {
+                return $nested;
+            }
+
+            continue;
+        }
+
+        $value = sanitize_text_field( wp_unslash( $value ) );
+        $value = trim( $value );
+
+        if ( '' !== $value ) {
+            return $value;
+        }
+    }
+
+    foreach ( $payload as $value ) {
+        if ( ! is_array( $value ) && ! is_object( $value ) ) {
+            continue;
+        }
+
+        $nested = woo_search_opt_find_search_term_in_payload( $value, $keys, $depth + 1 );
+
+        if ( '' !== $nested ) {
+            return $nested;
+        }
+    }
+
+    return '';
+}
+
+/**
  * Resolve the active search phrase for the current query or request context.
  *
  * @param WP_Query|null $wp_query Optional query instance to inspect.
@@ -318,6 +426,26 @@ function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
 
         $value = sanitize_text_field( wp_unslash( $value ) );
         $value = trim( $value );
+
+        if ( '' !== $value ) {
+            return $value;
+        }
+    }
+
+    $payload_keys = array( 'query_vars', 'query', 'queryArgs', 'query_args', 'form_data', 'data' );
+
+    foreach ( $payload_keys as $payload_key ) {
+        if ( ! isset( $_REQUEST[ $payload_key ] ) ) {
+            continue;
+        }
+
+        $payload = woo_search_opt_normalize_request_payload_to_array( $_REQUEST[ $payload_key ] );
+
+        if ( empty( $payload ) ) {
+            continue;
+        }
+
+        $value = woo_search_opt_find_search_term_in_payload( $payload, $request_keys );
 
         if ( '' !== $value ) {
             return $value;
