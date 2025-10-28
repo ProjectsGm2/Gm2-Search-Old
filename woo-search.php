@@ -68,6 +68,39 @@ function woo_search_opt_init_logger() {
 }
 add_action( 'plugins_loaded', 'woo_search_opt_init_logger' );
 
+// === Woo Search Optimized: force product search & default sort =================
+add_action( 'pre_get_posts', function( $q ) {
+    if ( ! function_exists( 'WC' ) ) {
+        return;
+    }
+
+    if ( ! $q instanceof WP_Query ) {
+        return;
+    }
+
+    if ( ! $q->is_main_query() ) {
+        return;
+    }
+
+    if ( ! $q->is_search() ) {
+        return;
+    }
+
+    $post_type = $q->get( 'post_type' );
+    if ( empty( $post_type ) || 'any' === $post_type ) {
+        $q->set( 'post_type', 'product' );
+    }
+
+    if ( ! $q->get( 'wc_query' ) ) {
+        $q->set( 'wc_query', 'product_query' );
+    }
+
+    $orderby = (string) $q->get( 'orderby' );
+    if ( '' === $orderby ) {
+        $q->set( 'orderby', 'relevance' );
+    }
+}, 20 );
+
 /**
  * Sanitize scalar values for logging output.
  *
@@ -2109,28 +2142,32 @@ function woo_search_opt_render_loop_pagination( $query ) {
         $current_page = 1;
     }
 
-    $search_phrase = woo_search_opt_resolve_search_phrase( $query );
-    $add_args      = array();
+    $add_args = isset( $add_args ) && is_array( $add_args ) ? $add_args : array();
 
-    if ( '' !== $search_phrase ) {
-        $add_args['s']               = sanitize_text_field( $search_phrase );
-        $add_args['gm2_search_term'] = sanitize_text_field( $search_phrase );
+    $search_phrase = get_query_var( 's', '' );
+    if ( '' === $search_phrase ) {
+        $search_phrase = woo_search_opt_resolve_search_phrase( $query );
     }
 
-    $orderby = $query->get( 'orderby' );
-    if ( is_string( $orderby ) && '' !== $orderby ) {
+    if ( '' !== $search_phrase ) {
+        $sanitized_search          = sanitize_text_field( $search_phrase );
+        $add_args['s']             = $sanitized_search;
+        $add_args['gm2_search_term'] = $sanitized_search;
+    }
+
+    $orderby = get_query_var( 'orderby', '' );
+    $order   = get_query_var( 'order', '' );
+
+    if ( '' === $orderby && '' !== $search_phrase ) {
+        $orderby = 'relevance';
+    }
+
+    if ( '' !== $orderby ) {
         $add_args['orderby'] = sanitize_text_field( $orderby );
     }
 
-    // Ensure explicit default sort is carried through pagination on search pages.
-    if ( ( ! isset( $add_args['orderby'] ) || '' === $add_args['orderby'] ) && '' !== $search_phrase ) {
-        // Woo recognizes `relevance` for product searches; this keeps page 2+ aligned with page 1.
-        $add_args['orderby'] = 'relevance';
-    }
-
-    $order = $query->get( 'order' );
-    if ( is_string( $order ) && '' !== $order ) {
-        $add_args['order'] = strtoupper( sanitize_text_field( $order ) );
+    if ( '' !== $order ) {
+        $add_args['order'] = sanitize_text_field( $order );
     }
 
     $add_args = array_filter( $add_args, 'strlen' );
@@ -2212,6 +2249,54 @@ function woo_search_opt_render_loop_pagination( $query ) {
 add_action( 'loop_end', 'woo_search_opt_render_loop_pagination' );
 
 /**
+ * Inject a "Best match" option into WooCommerce's catalog ordering dropdown.
+ *
+ * @param array $sorts Existing sort options.
+ *
+ * @return array Modified sort options.
+ */
+function woo_search_opt_register_best_match_sort( $sorts ) {
+    if ( ! is_array( $sorts ) ) {
+        $sorts = array();
+    }
+
+    $label = __( 'Best match (default)', 'woo-search-optimized' );
+
+    if ( ! isset( $sorts['relevance'] ) ) {
+        $sorts = array( 'relevance' => $label ) + $sorts;
+    } else {
+        $sorts['relevance'] = $label;
+    }
+
+    return $sorts;
+}
+add_filter( 'woocommerce_catalog_orderby', 'woo_search_opt_register_best_match_sort', 10, 1 );
+
+/**
+ * Ensure WooCommerce defers to custom relevance ordering when selected.
+ *
+ * @param array  $args    Ordering arguments.
+ * @param string $orderby Requested orderby token.
+ * @param string $order   Requested order direction.
+ *
+ * @return array
+ */
+function woo_search_opt_filter_relevance_ordering_args( $args, $orderby, $order ) {
+    if ( 'relevance' !== $orderby ) {
+        return $args;
+    }
+
+    unset( $args['orderby'], $args['meta_key'] );
+
+    if ( is_string( $order ) && '' !== $order ) {
+        $args['order'] = $order;
+    }
+
+    return $args;
+}
+add_filter( 'woocommerce_get_catalog_ordering_args', 'woo_search_opt_filter_relevance_ordering_args', 10, 3 );
+
+/**
  * Enqueue an inline helper script to persist the latest search phrase through AJAX sorters.
  */
 function woo_search_opt_enqueue_frontend_script() {
@@ -2220,16 +2305,6 @@ function woo_search_opt_enqueue_frontend_script() {
     }
 
     wp_enqueue_script( 'jquery' );
-
-    // Best-effort: ensure WC Quantity +/- script is present on product search pages.
-    $should_enqueue_qty = ( function_exists( 'is_search' ) && is_search() );
-    if ( $should_enqueue_qty ) {
-        // If the qty plugin registered a script handle, enqueue it here.
-        // Common handle name used by the plugin; harmless if unregistered.
-        if ( wp_script_is( 'wc-quantity-plus-minus-button', 'registered' ) && ! wp_script_is( 'wc-quantity-plus-minus-button', 'enqueued' ) ) {
-            wp_enqueue_script( 'wc-quantity-plus-minus-button' );
-        }
-    }
 
     $script = <<<'JS'
 (function($){
@@ -2399,35 +2474,65 @@ function woo_search_opt_enqueue_frontend_script() {
                 settings.data.s = term;
             }
         });
-
-        // --- Qty +/- compatibility (non-fatal if plugin absent) ---
-        function reinitQtyButtons(context) {
-            try {
-                context = context || document;
-
-                // Known patterns used by qty plugins:
-                if (typeof window.wcqib_refresh === 'function') {
-                    window.wcqib_refresh();
-                }
-                if (jQuery.fn && typeof jQuery.fn.wcqib_refresh === 'function') {
-                    jQuery(context).find('.quantity').wcqib_refresh();
-                }
-
-                // Generic nudge events some plugins listen to:
-                jQuery(document).trigger('qib_refresh');
-                jQuery(document).trigger('wc_quantity_plus_minus_refresh');
-            } catch (e) {
-                // No-op: compatibility only.
-            }
-        }
-
-        // Run on first paint and after Woo updates fragments.
-        reinitQtyButtons(document);
-        jQuery(document).on('updated_wc_div', function(){ reinitQtyButtons(document); });
     });
 })(jQuery);
 JS;
 
-    wp_add_inline_script( 'jquery', $script );
+    $handle = 'woo-search-opt-frontend';
+
+    if ( ! wp_script_is( $handle, 'registered' ) ) {
+        wp_register_script( $handle, false, array( 'jquery' ), '1.0.0', true );
+    }
+
+    wp_add_inline_script( $handle, $script );
+    wp_enqueue_script( $handle );
+
+    if ( function_exists( 'is_search' ) && is_search() ) {
+        $post_type = get_query_var( 'post_type', '' );
+        $is_product_search = ( 'product' === $post_type ) || ( is_array( $post_type ) && in_array( 'product', $post_type, true ) );
+
+        if ( ! $is_product_search && '' === $post_type ) {
+            $query = $GLOBALS['wp_query'];
+            if ( $query instanceof WP_Query ) {
+                $resolved_post_type = $query->get( 'post_type' );
+                $is_product_search  = ( 'product' === $resolved_post_type ) || ( is_array( $resolved_post_type ) && in_array( 'product', $resolved_post_type, true ) );
+            }
+        }
+
+        if ( $is_product_search ) {
+            if ( wp_script_is( 'wc-quantity-plus-minus-button', 'registered' ) && ! wp_script_is( 'wc-quantity-plus-minus-button', 'enqueued' ) ) {
+                wp_enqueue_script( 'wc-quantity-plus-minus-button' );
+            }
+
+            $qty_handle = 'woo-search-qty-compat';
+
+            if ( ! wp_script_is( $qty_handle, 'registered' ) ) {
+                wp_register_script( $qty_handle, false, array( 'jquery' ), '1.0.0', true );
+            }
+
+            $qty_script = <<<'JS'
+(function($){
+    function reinitQty(context){
+        try {
+            context = context || document;
+            if (typeof window.wcqib_refresh === 'function') { window.wcqib_refresh(); }
+            if ($.fn && typeof $.fn.wcqib_refresh === 'function') { $(context).find('.quantity').wcqib_refresh(); }
+            $(document).trigger('qib_refresh');
+            $(document).trigger('wc_quantity_plus_minus_refresh');
+        } catch(e) {}
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function(){ reinitQty(document); });
+    } else {
+        reinitQty(document);
+    }
+    $(document).on('updated_wc_div', function(){ reinitQty(document); });
+})(jQuery);
+JS;
+
+            wp_add_inline_script( $qty_handle, $qty_script );
+            wp_enqueue_script( $qty_handle );
+        }
+    }
 }
 add_action( 'wp_enqueue_scripts', 'woo_search_opt_enqueue_frontend_script' );
