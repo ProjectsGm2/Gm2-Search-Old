@@ -623,12 +623,169 @@ function woo_search_opt_get_requested_orderby() {
 }
 
 /**
+ * Collect potential Elementor query identifiers from the current request/query context.
+ *
+ * @param WP_Query|null $query Optional query instance.
+ *
+ * @return array
+ */
+function woo_search_opt_collect_elementor_query_ids( $query = null ) {
+    $query_ids       = array();
+    $candidate_keys  = array( 'elementor_query_id', 'query_id', 'elementor_widget_id' );
+    $additional_keys = array( 'elementor_page_id' );
+
+    if ( $query instanceof WP_Query ) {
+        foreach ( array_merge( $candidate_keys, $additional_keys ) as $key ) {
+            $value = $query->get( $key );
+
+            if ( is_string( $value ) && '' !== trim( $value ) ) {
+                $query_ids[] = trim( $value );
+            }
+        }
+
+        if ( isset( $query->query_vars ) && is_array( $query->query_vars ) ) {
+            foreach ( array_merge( $candidate_keys, $additional_keys ) as $key ) {
+                if ( isset( $query->query_vars[ $key ] ) && is_string( $query->query_vars[ $key ] ) ) {
+                    $value = trim( $query->query_vars[ $key ] );
+
+                    if ( '' !== $value ) {
+                        $query_ids[] = $value;
+                    }
+                }
+            }
+        }
+    }
+
+    if ( function_exists( 'get_query_var' ) ) {
+        foreach ( array_merge( $candidate_keys, $additional_keys ) as $key ) {
+            $value = get_query_var( $key );
+
+            if ( is_string( $value ) && '' !== trim( $value ) ) {
+                $query_ids[] = trim( $value );
+            }
+        }
+    }
+
+    foreach ( $candidate_keys as $key ) {
+        $value = woo_search_opt_resolve_request_scalar( array( $key ) );
+
+        if ( '' !== $value ) {
+            $query_ids[] = $value;
+        }
+    }
+
+    $query_ids = array_filter( array_map( 'trim', $query_ids ) );
+
+    return array_values( array_unique( $query_ids ) );
+}
+
+/**
+ * Determine whether the current query likely originates from Elementor.
+ *
+ * @param WP_Query|null $query Optional query instance.
+ *
+ * @return bool
+ */
+function woo_search_opt_is_elementor_context( $query = null ) {
+    if ( $query instanceof WP_Query ) {
+        $elementor_keys = array( 'elementor_ajax', 'elementor_page', 'elementor_query_id', 'elementor_widget_id', 'elementor_page_id' );
+
+        foreach ( $elementor_keys as $key ) {
+            $value = $query->get( $key );
+
+            if ( ! empty( $value ) ) {
+                return true;
+            }
+        }
+    }
+
+    if ( isset( $_REQUEST['elementor_ajax'] ) || isset( $_REQUEST['elementor_page'] ) || isset( $_REQUEST['elementor_page_id'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Compile the supported Elementor pagination keys derived from the request/query context.
+ *
+ * @param WP_Query|null $query Optional query instance.
+ *
+ * @return array
+ */
+function woo_search_opt_collect_elementor_pagination_keys( $query = null ) {
+    $query_ids = woo_search_opt_collect_elementor_query_ids( $query );
+    $keys      = array();
+
+    foreach ( $query_ids as $query_id ) {
+        $variants = array( $query_id );
+        $variants[] = sanitize_key( $query_id );
+        $variants[] = strtolower( $query_id );
+        $variants[] = str_replace( '-', '_', $query_id );
+        $variants[] = str_replace( '-', '_', sanitize_key( $query_id ) );
+
+        foreach ( $variants as $variant ) {
+            if ( ! is_string( $variant ) ) {
+                continue;
+            }
+
+            $variant = trim( $variant );
+
+            if ( '' === $variant ) {
+                continue;
+            }
+
+            $variant = preg_replace( '/[^a-z0-9_\-]/i', '_', $variant );
+            $variant = trim( $variant, '_' );
+
+            if ( '' === $variant ) {
+                continue;
+            }
+
+            $keys[] = $variant . '_page';
+        }
+    }
+
+    return array_values( array_unique( $keys ) );
+}
+
+/**
  * Resolve the requested pagination page from the current request payloads.
+ *
+ * @param WP_Query|null $query Optional query instance.
  *
  * @return int
  */
-function woo_search_opt_get_requested_paged() {
-    $value = woo_search_opt_resolve_request_scalar( array( 'paged', 'page', 'current_page' ) );
+function woo_search_opt_get_requested_paged( $query = null ) {
+    $fallback_keys   = array( 'paged', 'page', 'current_page', 'product-page', 'elementor_page' );
+    $resolved_key    = '';
+    $value           = '';
+    $elementor_keys  = woo_search_opt_collect_elementor_pagination_keys( $query );
+    $candidate_keys  = array_merge( $fallback_keys, $elementor_keys );
+
+    foreach ( $candidate_keys as $key ) {
+        $candidate_value = woo_search_opt_resolve_request_scalar( array( $key ) );
+
+        if ( '' !== $candidate_value ) {
+            $resolved_key = $key;
+            $value        = $candidate_value;
+            break;
+        }
+    }
+
+    if ( '' === $resolved_key ) {
+        if ( ! empty( $elementor_keys ) ) {
+            $resolved_key = $elementor_keys[0];
+        } elseif ( woo_search_opt_is_elementor_context( $query ) ) {
+            $resolved_key = 'product-page';
+        } else {
+            $resolved_key = 'paged';
+        }
+    }
+
+    if ( $query instanceof WP_Query ) {
+        $query->set( 'woo_search_opt_resolved_paged_var', $resolved_key );
+    }
 
     if ( '' === $value ) {
         return 0;
@@ -1104,7 +1261,7 @@ if ( ! function_exists( 'woo_search_opt_log_query' ) ) {
                 );
             }
 
-            $requested_paged = woo_search_opt_get_requested_paged();
+            $requested_paged = woo_search_opt_get_requested_paged( $query );
             $current_paged   = absint( $query->get( 'paged' ) );
             $resolved_paged  = $current_paged;
 
@@ -1935,13 +2092,62 @@ function woo_search_opt_render_loop_pagination( $query ) {
 
     $add_args = array_filter( $add_args, 'strlen' );
 
-    $big       = 999999999;
+    $pagination_var = $query->get( 'woo_search_opt_resolved_paged_var' );
+    $pagination_var = is_string( $pagination_var ) ? trim( $pagination_var ) : '';
+    $elementor_keys = woo_search_opt_collect_elementor_pagination_keys( $query );
+
+    if ( '' === $pagination_var ) {
+        if ( ! empty( $elementor_keys ) ) {
+            $pagination_var = $elementor_keys[0];
+        } elseif ( woo_search_opt_is_elementor_context( $query ) ) {
+            $pagination_var = 'product-page';
+        }
+    }
+
+    if ( '' === $pagination_var ) {
+        $pagination_var = 'paged';
+    }
+
+    $pagination_var = preg_replace( '/[^a-z0-9_\-]/i', '', $pagination_var );
+
+    if ( '' === $pagination_var ) {
+        $pagination_var = 'paged';
+    }
+
+    $big    = 999999999;
+    $format = '';
     $base_link = str_replace( $big, '%#%', esc_url( get_pagenum_link( $big ) ) );
+
+    if ( ! in_array( $pagination_var, array( 'paged', 'page' ), true ) ) {
+        $cleanup_keys = array_merge(
+            array( 'paged', 'page', 'product-page', 'elementor_page', $pagination_var ),
+            $elementor_keys
+        );
+
+        $cleanup_keys = array_values( array_unique( array_filter( array_map( 'strval', $cleanup_keys ) ) ) );
+
+        $raw_base_url = get_pagenum_link( 1, false );
+
+        if ( ! is_string( $raw_base_url ) || '' === $raw_base_url ) {
+            $raw_base_url = get_pagenum_link( 1 );
+        }
+
+        if ( is_string( $raw_base_url ) && '' !== $raw_base_url ) {
+            $raw_base_url = remove_query_arg( $cleanup_keys, $raw_base_url );
+        } else {
+            $raw_base_url = home_url( '/' );
+        }
+
+        $format_glue = ( false === strpos( $raw_base_url, '?' ) ) ? '?' : '&';
+
+        $base_link = esc_url( $raw_base_url ) . '%_%';
+        $format    = $format_glue . $pagination_var . '=%#%';
+    }
 
     $pagination = paginate_links(
         array(
             'base'      => $base_link,
-            'format'    => '',
+            'format'    => $format,
             'current'   => max( 1, (int) $current_page ),
             'total'     => $total_pages,
             'type'      => 'list',
