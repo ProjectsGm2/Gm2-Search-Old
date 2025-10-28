@@ -2592,110 +2592,73 @@ JS;
     wp_add_inline_script( $handle, $script );
     wp_enqueue_script( $handle );
 
-    if ( function_exists( 'is_search' ) && is_search() ) {
-        $post_type = get_query_var( 'post_type', '' );
-        $is_product_search = ( 'product' === $post_type ) || ( is_array( $post_type ) && in_array( 'product', $post_type, true ) );
-
-        if ( ! $is_product_search && '' === $post_type ) {
-            $query = $GLOBALS['wp_query'];
-            if ( $query instanceof WP_Query ) {
-                $resolved_post_type = $query->get( 'post_type' );
-                $is_product_search  = ( 'product' === $resolved_post_type ) || ( is_array( $resolved_post_type ) && in_array( 'product', $resolved_post_type, true ) );
-            }
-        }
-
-        if ( $is_product_search ) {
-            woo_search_opt_debug( 'qty:enqueue_on_product_search' );
-
-            if ( wp_script_is( 'wc-quantity-plus-minus-button', 'registered' ) && ! wp_script_is( 'wc-quantity-plus-minus-button', 'enqueued' ) ) {
-                wp_enqueue_script( 'wc-quantity-plus-minus-button' );
-                woo_search_opt_debug( 'qty:enqueued_third_party' );
-            }
-
-            $qty_handle = 'woo-search-qty-compat';
-
-            if ( ! wp_script_is( $qty_handle, 'registered' ) ) {
-                wp_register_script( $qty_handle, false, array( 'jquery' ), '1.0.0', true );
-            }
-
-            $qty_script = <<<'JS'
-(function($){
-    var WSO_QTY = {
-        log: function(evt){
-            try { console.log('[woo-search][qty] ' + evt); } catch(e){}
-        },
-        ensureButtons: function(ctx){
-            var $ctx = $(ctx||document);
-            $ctx.find('.quantity input[type="number"]').each(function(){
-                var $input = $(this);
-                if ($input.data('wso-qfy')) { return; }
-                $input.data('wso-qfy', true);
-                var $wrap = $input.closest('.quantity');
-                if ($wrap.find('.wso-qty-minus').length === 0) {
-                    $('<button type="button" class="wso-qty-minus">-</button>').insertBefore($input);
-                }
-                if ($wrap.find('.wso-qty-plus').length === 0) {
-                    $('<button type="button" class="wso-qty-plus">+</button>').insertAfter($input);
-                }
-            });
-        },
-        bindHandlers: function(ctx){
-            var $ctx = $(ctx||document);
-            $ctx.off('click.wsoQty', '.wso-qty-minus, .wso-qty-plus').on('click.wsoQty', '.wso-qty-minus, .wso-qty-plus', function(e){
-                e.preventDefault();
-                var $btn = $(this);
-                var $qty = $btn.siblings('input[type="number"]');
-                if (!$qty.length) {
-                    $qty = $btn.closest('.quantity').find('input[type="number"]');
-                }
-                var step = parseFloat($qty.attr('step')) || 1;
-                var min = parseFloat($qty.attr('min'));
-                var max = parseFloat($qty.attr('max'));
-                var val = parseFloat($qty.val()) || 0;
-                if ($btn.hasClass('wso-qty-minus')) {
-                    val -= step;
-                } else {
-                    val += step;
-                }
-                if (!isNaN(min)) { val = Math.max(min, val); }
-                if (!isNaN(max)) { val = Math.min(max, val); }
-                $qty.val(val).trigger('change');
-            });
-        },
-        tryThirdParty: function(ctx){
-            try {
-                if (typeof window.wcqib_refresh === 'function') { window.wcqib_refresh(); WSO_QTY.log('third_party:wcqib_refresh'); }
-                if ($.fn && typeof $.fn.wcqib_refresh === 'function') { $(ctx||document).find('.quantity').wcqib_refresh(); WSO_QTY.log('third_party:jQuery_wcqib_refresh'); }
-                $(document).trigger('qib_refresh').trigger('wc_quantity_plus_minus_refresh');
-            } catch(e){}
-        },
-        reinit: function(ctx){
-            WSO_QTY.ensureButtons(ctx);
-            WSO_QTY.bindHandlers(ctx);
-            WSO_QTY.tryThirdParty(ctx);
-        }
-    };
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function(){ WSO_QTY.reinit(document); WSO_QTY.log('DOMContentLoaded'); });
-    } else {
-        WSO_QTY.reinit(document);
-        WSO_QTY.log('dom_ready_now');
-    }
-
-    $(document)
-        .on('updated_wc_div', function(){ WSO_QTY.reinit(document); WSO_QTY.log('updated_wc_div'); })
-        .on('ajaxComplete', function(){ WSO_QTY.reinit(document); WSO_QTY.log('ajaxComplete'); })
-        .on('woof_ajax_done', function(){ WSO_QTY.reinit(document); WSO_QTY.log('woof_ajax_done'); })
-        .on('yith-wcan-ajax-filtered', function(){ WSO_QTY.reinit(document); WSO_QTY.log('yith-wcan-ajax-filtered'); })
-        .on('gm2_filter_products_done', function(){ WSO_QTY.reinit(document); WSO_QTY.log('gm2_filter_products_done'); });
-
-})(jQuery);
-JS;
-
-            wp_add_inline_script( $qty_handle, $qty_script );
-            wp_enqueue_script( $qty_handle );
-        }
-    }
 }
 add_action( 'wp_enqueue_scripts', 'woo_search_opt_enqueue_frontend_script' );
+
+// === Qty buttons: use the official plugin only; re-init on search & pagination ===
+add_action( 'wp_enqueue_scripts', function() {
+    // Helper (logger): prefer your existing logger if available
+    if ( ! function_exists( 'woo_search_opt_debug' ) ) {
+        function woo_search_opt_debug( $m, $c = array() ) {
+            if ( function_exists( 'woo_search_opt_log' ) ) { woo_search_opt_log( $m, $c ); return; }
+            if ( ! empty( $c ) ) { $m .= ' | ' . wp_json_encode( $c ); }
+            error_log( '[woo-search] ' . $m );
+        }
+    }
+
+    $is_product_search = is_search() && ( get_query_var( 'post_type', '' ) === 'product' || 'product' === get_query_var( 'post_type', '' ) );
+    $is_product_archive = ( function_exists( 'is_post_type_archive' ) && is_post_type_archive( 'product' ) )
+        || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
+
+    if ( $is_product_search || $is_product_archive ) {
+        // Try to enqueue the 3rd-party qty script if it is registered under known handles
+        $enqueued_handle = null;
+        foreach ( array( 'wc-quantity-plus-minus-button', 'quantity-plus-minus', 'wcqib' ) as $h ) {
+            if ( wp_script_is( $h, 'registered' ) ) { wp_enqueue_script( $h ); $enqueued_handle = $h; break; }
+        }
+        woo_search_opt_debug( 'qty:enqueue', array(
+            'context' => $is_product_search ? 'search' : 'archive',
+            'enqueued_handle' => $enqueued_handle,
+        ) );
+
+        // Our minimal, idempotent re-init: call the plugin's refresh if present; otherwise emit its common events.
+        $handle = 'woo-search-qty-reinit';
+        wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
+        wp_add_inline_script( $handle, <<<JS
+(function($){
+    function wsoQtyReinit(ctx){
+        try {
+            // Prefer explicit API if the qty plugin exposes it
+            if (typeof window.wcqib_refresh === 'function') { window.wcqib_refresh(); }
+            if ($.fn && typeof $.fn.wcqib_refresh === 'function') { $(ctx || document).find('.quantity').wcqib_refresh(); }
+            // Also trigger common events that qty plugins listen to
+            $(document).trigger('qib_refresh').trigger('wc_quantity_plus_minus_refresh');
+            if (window.console && console.debug) { console.debug('[woo-search][qty] reinit'); }
+        } catch (e) {}
+    }
+
+    // Full page navigation (covers page 2 via normal links)
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function(){ wsoQtyReinit(document); });
+    } else {
+        wsoQtyReinit(document);
+    }
+
+    // WooCommerce / theme / Elementor AJAX redraws:
+    $(document)
+      .on('updated_wc_div', function(){ wsoQtyReinit(document); })
+      .on('ajaxComplete', function(){ wsoQtyReinit(document); })
+      // If your plugin fires a custom event after its own AJAX:
+      .on('gm2_filter_products_done', function(){ wsoQtyReinit(document); });
+
+})(jQuery);
+JS
+        );
+        wp_enqueue_script( $handle );
+
+        woo_search_opt_debug( 'qty:inline_reinit_added', array(
+            'search'  => $is_product_search,
+            'archive' => $is_product_archive
+        ) );
+    }
+}, 20 );
