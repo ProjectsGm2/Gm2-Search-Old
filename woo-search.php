@@ -13,8 +13,34 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+// --- Robust file logger to uploads/woo-search.log ---
+if ( ! function_exists( 'wso_log' ) ) {
+    function wso_log( $msg, $ctx = array() ) {
+        $prefix = '[woo-search] ';
+        if ( ! empty( $ctx ) ) {
+            $msg .= ' | ' . wp_json_encode( $ctx );
+        }
+        $line = gmdate( 'c' ) . ' ' . $prefix . $msg . PHP_EOL;
+
+        if ( function_exists( 'wp_upload_dir' ) ) {
+            $ud = wp_upload_dir();
+            if ( ! empty( $ud['basedir'] ) && is_dir( $ud['basedir'] ) && is_writable( $ud['basedir'] ) ) {
+                $file = trailingslashit( $ud['basedir'] ) . 'woo-search.log';
+                @file_put_contents( $file, $line, FILE_APPEND | LOCK_EX );
+            }
+        }
+
+        error_log( $line );
+    }
+}
+
 if ( ! function_exists( 'woo_search_opt_log' ) ) {
     function woo_search_opt_log( $msg, $ctx = array() ) {
+        if ( function_exists( 'wso_log' ) ) {
+            wso_log( $msg, $ctx );
+            return;
+        }
+
         if ( ! empty( $ctx ) ) {
             $msg .= ' | ' . wp_json_encode( $ctx );
         }
@@ -2604,39 +2630,122 @@ JS;
 }
 add_action( 'wp_enqueue_scripts', 'woo_search_opt_enqueue_frontend_script' );
 
-// === Inject a real Woo quantity input into loop items (search/archive) ===
-add_filter( 'woocommerce_loop_add_to_cart_link', function( $html, $product, $args ) {
-    if ( ! function_exists( 'woo_search_opt_log' ) ) {
-        function woo_search_opt_log( $m, $c = array() ) {
-            if ( ! empty( $c ) ) { $m .= ' | ' . wp_json_encode( $c ); }
-            error_log( '[woo-search] ' . $m );
-        }
+// === Ensure qty plugin assets exist + add minimal re-init (no custom +/- UI) ===
+add_action( 'wp_enqueue_scripts', function() {
+    $is_product_search  = is_search() && ( get_query_var( 'post_type', '' ) === 'product' || 'product' === get_query_var( 'post_type', '' ) );
+    $is_product_archive = ( function_exists( 'is_post_type_archive' ) && is_post_type_archive( 'product' ) )
+                       || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
+
+    wso_log( 'qty:enqueue_probe', array(
+        'is_search'  => is_search() ? 1 : 0,
+        'post_type'  => get_query_var( 'post_type', '' ),
+        'is_archive' => $is_product_archive ? 1 : 0,
+    ) );
+
+    if ( ! ( $is_product_search || $is_product_archive ) ) {
+        return;
     }
 
-    // Gate: OFF by default (prevents duplicate qty when the theme/widget also renders qty).
-    $enable_loop_qty_injection = apply_filters(
-        'woo_search_opt_enable_loop_qty_injection',
-        get_option( 'woo_search_opt_enable_loop_qty_injection', 'no' ) === 'yes'
-    );
+    $script = null;
+    $style  = null;
 
-    if ( ! $enable_loop_qty_injection ) {
-        // Do not inject our own qty input; let the 3rd-party plugin enhance the theme/widget's qty.
+    if ( wp_script_is( 'wqpmb-script', 'registered' ) && ! wp_script_is( 'wqpmb-script', 'enqueued' ) ) {
+        wp_enqueue_script( 'wqpmb-script' );
+        $script = 'wqpmb-script';
+    } elseif ( wp_script_is( 'wqpmb-script', 'enqueued' ) ) {
+        $script = 'wqpmb-script';
+    }
+
+    if ( wp_style_is( 'wqpmb-style', 'registered' ) && ! wp_style_is( 'wqpmb-style', 'enqueued' ) ) {
+        wp_enqueue_style( 'wqpmb-style' );
+        $style = 'wqpmb-style';
+    } elseif ( wp_style_is( 'wqpmb-style', 'enqueued' ) ) {
+        $style = 'wqpmb-style';
+    }
+
+    wso_log( 'qty:enqueue_result', array( 'script' => $script, 'style' => $style ) );
+
+    $handle = 'wso-qty-reinit';
+    if ( ! wp_script_is( $handle, 'enqueued' ) ) {
+        wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
+        wp_add_inline_script( $handle, <<<JS
+(function($){
+    var LOG='[woo-search][qty] ';
+    function reinit(){ try{ $(document).trigger('ajaxComplete'); if(console&&console.debug) console.debug(LOG+'reinit'); }catch(e){} }
+
+    if (document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', reinit); } else { reinit(); }
+
+    $(document)
+      .on('updated_wc_div wc_fragments_refreshed', reinit)
+      .on('ajaxComplete', reinit)
+      .on('gm2_filter_products_done', reinit);
+
+    (function(){
+        var root=document.querySelector('.products')||document.querySelector('.woocommerce');
+        if(!root||!window.MutationObserver) return;
+        var mo=new MutationObserver(function(muts){
+            for(var i=0;i<muts.length;i++){
+                var m=muts[i];
+                if(m.addedNodes&&m.addedNodes.length){
+                    for(var j=0;j<m.addedNodes.length;j++){
+                        var n=m.addedNodes[j];
+                        if(!(n instanceof HTMLElement)) continue;
+                        if((n.matches&& (n.matches('.product')||n.matches('.quantity')||n.matches('input.qty')))
+                           || (n.querySelector && (n.querySelector('.product')||n.querySelector('.quantity')||n.querySelector('input.qty')))){
+                            setTimeout(reinit,0); return;
+                        }
+                    }
+                }
+            }
+        });
+        mo.observe(root,{childList:true,subtree:true});
+    })();
+})(jQuery);
+JS
+        );
+        wp_enqueue_script( $handle );
+        wso_log( 'qty:inline_reinit_added' );
+    }
+}, 999 );
+
+// === Loop qty: inject a real Woo qty input ONLY if the button HTML has none ===
+add_filter( 'woocommerce_loop_add_to_cart_link', function( $html, $product, $args ) {
+    if ( ! $product || ! is_a( $product, 'WC_Product' ) ) {
         return $html;
     }
 
-    $in_catalog = ( function_exists( 'is_product' ) && ! is_product() )
-        && ( is_search() || ( function_exists( 'is_shop' ) && is_shop() )
-             || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() ) );
+    if ( function_exists( 'is_product' ) && is_product() ) {
+        return $html;
+    }
+
+    $in_catalog = is_search()
+        || ( function_exists( 'is_shop' ) && is_shop() )
+        || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
 
     if ( ! $in_catalog ) {
         return $html;
     }
 
-    if ( ! $product || ! is_a( $product, 'WC_Product' ) ) { return $html; }
-    if ( ! $product->is_type( 'simple' ) ) { return $html; }
-    if ( ! $product->is_purchasable() ) { return $html; }
-    if ( ! $product->is_in_stock() ) { return $html; }
-    if ( $product->is_sold_individually() ) { return $html; }
+    if ( ! $product->is_type( 'simple' ) || ! $product->is_purchasable() || ! $product->is_in_stock() || $product->is_sold_individually() ) {
+        return $html;
+    }
+
+    $has_qty = ( stripos( $html, 'class="quantity' ) !== false )
+            || ( stripos( $html, "class='quantity" ) !== false )
+            || ( stripos( $html, 'class="qty' ) !== false )
+            || ( stripos( $html, "class='qty" ) !== false )
+            || ( stripos( $html, 'name="quantity' ) !== false )
+            || ( stripos( $html, "name='quantity" ) !== false );
+
+    wso_log( 'qty:inject_check', array(
+        'product_id' => $product->get_id(),
+        'has_qty'    => $has_qty ? 1 : 0,
+        'ajax'       => ( defined( 'DOING_AJAX' ) && DOING_AJAX ) ? 1 : 0,
+    ) );
+
+    if ( $has_qty ) {
+        return $html;
+    }
 
     $qty_html = woocommerce_quantity_input( array(
         'input_value' => 1,
@@ -2648,9 +2757,9 @@ add_filter( 'woocommerce_loop_add_to_cart_link', function( $html, $product, $arg
 
     $out = '<div class="wso-loop-quantity-wrapper">' . $qty_html . '</div>' . $html;
 
-    woo_search_opt_log( 'qty:injected_loop_quantity', array(
+    wso_log( 'qty:injected_loop_quantity', array(
         'product_id' => $product->get_id(),
-        'context'    => is_search() ? 'search' : ( is_shop() ? 'shop' : 'tax' ),
+        'ajax'       => ( defined( 'DOING_AJAX' ) && DOING_AJAX ) ? 1 : 0,
     ) );
 
     return $out;
@@ -2691,73 +2800,93 @@ add_action( 'woocommerce_after_shop_loop_item_title', function() {
 
     echo '<div class="wso-loop-stock">' . $stock_html . '</div>';
 
-    woo_search_opt_log( 'stock:printed_in_loop', array(
+    wso_log( 'stock:printed_in_loop', array(
         'product_id' => $product->get_id(),
         'ajax'       => $is_ajax ? 1 : 0,
         'context'    => is_search() ? 'search' : ( function_exists( 'is_shop' ) && is_shop() ? 'shop' : 'tax' ),
     ) );
 }, 22 );
 
-add_filter( 'woocommerce_result_count', function( $html ) {
-    $total        = wc_get_loop_prop( 'total', null );
-    $per_page     = wc_get_loop_prop( 'per_page', null );
-    $current_page = wc_get_loop_prop( 'current_page', null );
+// Ensure add_to_cart anchors pick up the closest qty value
+add_action( 'wp_enqueue_scripts', function() {
+    $handle = 'wso-qty-sync';
+    if ( wp_script_is( $handle, 'enqueued' ) ) {
+        return;
+    }
+    wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
+    wp_add_inline_script( $handle, <<<JS
+jQuery(document).off('click.wsoQtySync','.add_to_cart_button').on('click.wsoQtySync','.add_to_cart_button',function(){
+    var $btn=jQuery(this), $qty=$btn.closest('li.product, .product, .woocommerce').find('.quantity input.qty').first();
+    if($qty.length){ var v=$qty.val(); $btn.attr('data-quantity',v).data('quantity',v); }
+});
+JS
+    );
+    wp_enqueue_script( $handle );
+}, 30 );
 
-    $used_loop_props = ( null !== $total && null !== $per_page && null !== $current_page );
+// === Populate Woo loop props for product loops (helps result count on AJAX redraws) ===
+add_action( 'loop_start', function( $query ) {
+    if ( ! ( $query instanceof WP_Query ) ) {
+        return;
+    }
+
+    $pt = $query->get( 'post_type', null );
+    $is_product_loop = ( $pt === 'product' )
+        || ( is_array( $pt ) && in_array( 'product', $pt, true ) )
+        || ( $query->get( 'wc_query' ) === 'product_query' );
+
+    if ( ! $is_product_loop ) {
+        return;
+    }
+
+    if ( function_exists( 'wc_set_loop_prop' ) ) {
+        $total        = (int) $query->found_posts;
+        $per_page     = (int) $query->get( 'posts_per_page', 0 );
+        $current_page = max( 1, (int) $query->get( 'paged', 1 ) );
+
+        wc_set_loop_prop( 'total', $total );
+        wc_set_loop_prop( 'per_page', $per_page );
+        wc_set_loop_prop( 'current_page', $current_page );
+
+        wso_log( 'loop_start:set_loop_props', array(
+            'total'        => $total,
+            'per_page'     => $per_page,
+            'current_page' => $current_page,
+        ) );
+    }
+}, 5 );
+
+// === Replace result count using Woo loop props (fallback safe) ===
+add_filter( 'woocommerce_result_count', function( $html ) {
+    $total        = function_exists( 'wc_get_loop_prop' ) ? wc_get_loop_prop( 'total', null ) : null;
+    $per_page     = function_exists( 'wc_get_loop_prop' ) ? wc_get_loop_prop( 'per_page', null ) : null;
+    $current_page = function_exists( 'wc_get_loop_prop' ) ? wc_get_loop_prop( 'current_page', null ) : null;
+
+    $used_loop_props = ( $total !== null && $per_page !== null && $current_page !== null );
 
     if ( ! $used_loop_props ) {
         global $wp_query;
-
-        if ( $wp_query instanceof WP_Query ) {
-            $total        = isset( $wp_query->found_posts ) ? intval( $wp_query->found_posts ) : 0;
-            $per_page     = intval( get_query_var( 'posts_per_page', 0 ) );
-            $current_page = max( 1, intval( get_query_var( 'paged', 1 ) ) );
-        } else {
-            $total = 0;
-            $per_page = 0;
-            $current_page = 1;
-        }
+        $total        = isset( $wp_query->found_posts ) ? (int) $wp_query->found_posts : 0;
+        $per_page     = (int) get_query_var( 'posts_per_page', 0 );
+        $current_page = max( 1, (int) get_query_var( 'paged', 1 ) );
     }
 
     $first = 0;
     $last  = 0;
-
     if ( $total > 0 && $per_page > 0 ) {
         $first = ( $per_page * ( $current_page - 1 ) ) + 1;
         $last  = min( $total, $per_page * $current_page );
     }
-
     if ( $last < $first ) {
-        if ( $total > 0 ) {
-            $first = 1;
-            $last  = min( $total, $per_page ? $per_page : $total );
-        } else {
-            $first = 0;
-            $last  = 0;
-        }
+        $first = ( $total > 0 ) ? 1 : 0;
+        $last  = ( $total > 0 ) ? min( $total, $per_page ?: $total ) : 0;
     }
 
-    if ( $per_page <= 0 ) {
-        $per_page = $total;
-    }
+    $text = ( $total <= $per_page )
+        ? sprintf( __( 'Showing all %d results', 'woocommerce' ), $total )
+        : sprintf( __( 'Showing %1$d–%2$d of %3$d results', 'woocommerce' ), $first, $last, $total );
 
-    if ( $total <= $per_page ) {
-        $new = sprintf(
-            /* translators: %d: total results */
-            __( 'Showing all %d results', 'woocommerce' ),
-            $total
-        );
-    } else {
-        $new = sprintf(
-            /* translators: 1: first result 2: last result 3: total results */
-            __( 'Showing %1$d–%2$d of %3$d results', 'woocommerce' ),
-            $first,
-            $last,
-            $total
-        );
-    }
-
-    woo_search_opt_log( 'result_count:computed', array(
+    wso_log( 'result_count:computed', array(
         'used_loop_props' => $used_loop_props ? 1 : 0,
         'total'           => $total,
         'per_page'        => $per_page,
@@ -2767,130 +2896,5 @@ add_filter( 'woocommerce_result_count', function( $html ) {
         'is_search'       => is_search() ? 1 : 0,
     ) );
 
-    return sprintf( '<p class="woocommerce-result-count">%s</p>', esc_html( $new ) );
+    return '<p class="woocommerce-result-count">' . esc_html( $text ) . '</p>';
 }, 10, 1 );
-
-// === Qty buttons: rely on official plugin assets and re-init on redraws ===
-add_action( 'wp_enqueue_scripts', function() {
-    if ( ! function_exists( 'woo_search_opt_log' ) ) {
-        function woo_search_opt_log( $msg, $ctx = array() ) {
-            if ( ! empty( $ctx ) ) { $msg .= ' | ' . wp_json_encode( $ctx ); }
-            error_log( '[woo-search] ' . $msg );
-        }
-    }
-
-    $is_product_search  = is_search() && ( get_query_var( 'post_type', '' ) === 'product' || 'product' === get_query_var( 'post_type', '' ) );
-    $is_product_archive = ( function_exists( 'is_post_type_archive' ) && is_post_type_archive( 'product' ) )
-                          || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
-
-    woo_search_opt_log( 'qty:enqueue_probe', array(
-        'is_search'  => is_search(),
-        'post_type'  => get_query_var( 'post_type', '' ),
-        'is_archive' => $is_product_archive,
-    ) );
-
-    if ( ! ( $is_product_search || $is_product_archive ) ) {
-        return;
-    }
-
-    global $wp_scripts;
-    if ( isset( $wp_scripts->registered ) && is_array( $wp_scripts->registered ) ) {
-        $all_handles = array_keys( $wp_scripts->registered );
-        woo_search_opt_log( 'qty:handles_TEMP', array(
-            'count'   => count( $all_handles ),
-            'first25' => array_slice( $all_handles, 0, 25 ),
-            'context' => $is_product_search ? 'search' : 'archive',
-        ) );
-    } else {
-        woo_search_opt_log( 'qty:handles_TEMP:no_registered_scripts' );
-    }
-
-    $qty_script_handles = array( 'wqpmb-script' );
-    $qty_style_handles  = array( 'wqpmb-style' );
-
-    $enqueued_script = null;
-    foreach ( $qty_script_handles as $h ) {
-        if ( wp_script_is( $h, 'enqueued' ) || wp_script_is( $h, 'to_enqueue' ) ) { $enqueued_script = $h; break; }
-        if ( wp_script_is( $h, 'registered' ) ) { wp_enqueue_script( $h ); $enqueued_script = $h; break; }
-    }
-
-    $enqueued_style = null;
-    foreach ( $qty_style_handles as $hs ) {
-        if ( wp_style_is( $hs, 'enqueued' ) || wp_style_is( $hs, 'to_enqueue' ) ) { $enqueued_style = $hs; break; }
-        if ( wp_style_is( $hs, 'registered' ) ) { wp_enqueue_style( $hs ); $enqueued_style = $hs; break; }
-    }
-
-    woo_search_opt_log( 'qty:enqueue_result', array(
-        'context'          => $is_product_search ? 'search' : 'archive',
-        'script_handle'    => $enqueued_script,
-        'style_handle'     => $enqueued_style,
-    ) );
-
-    $handle = 'woo-search-qty-reinit-final';
-    wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
-    wp_add_inline_script( $handle, <<<JS
-(function($){
-    var LOG = '[woo-search][qty] ';
-
-    function wsoQtyReinit(){
-        if (wsoQtyReinit._running) {
-            return;
-        }
-        wsoQtyReinit._running = true;
-        try {
-            $(document).trigger('ajaxComplete');
-            if (window.console && console.debug) { console.debug(LOG + 'reinit'); }
-        } catch(e){}
-        wsoQtyReinit._running = false;
-    }
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function(){ wsoQtyReinit(); });
-    } else {
-        wsoQtyReinit();
-    }
-
-    $(document)
-      .on('updated_wc_div wc_fragments_refreshed', function(){ wsoQtyReinit(); })
-      .on('ajaxComplete', function(){ wsoQtyReinit(); })
-      .on('gm2_filter_products_done', function(){ wsoQtyReinit(); });
-
-    (function observeProducts(){
-        var root = document.querySelector('.products') || document.querySelector('.woocommerce');
-        if (!root || !window.MutationObserver) return;
-        var scheduled = false;
-        var mo = new MutationObserver(function(muts){
-            for (var i = 0; i < muts.length; i++) {
-                var m = muts[i];
-                if (m.addedNodes && m.addedNodes.length) {
-                    for (var j = 0; j < m.addedNodes.length; j++) {
-                        var n = m.addedNodes[j];
-                        if (!(n instanceof HTMLElement)) continue;
-                        if (n.matches && (n.matches('.product') || n.matches('.quantity') || n.matches('input.qty'))) { scheduled = true; break; }
-                        if (n.querySelector && (n.querySelector('.product') || n.querySelector('.quantity') || n.querySelector('input.qty'))) { scheduled = true; break; }
-                    }
-                }
-                if (scheduled) { break; }
-            }
-            if (scheduled) {
-                scheduled = false;
-                setTimeout(wsoQtyReinit, 0);
-            }
-        });
-        mo.observe(root, { childList: true, subtree: true });
-    })();
-
-    $(document).off('click.wsoQtySync', '.add_to_cart_button').on('click.wsoQtySync', '.add_to_cart_button', function(){
-        var $btn = $(this);
-        var $qty = $btn.closest('li.product, .product, .woocommerce').find('.quantity input.qty').first();
-        if ($qty.length) {
-            var val = $qty.val();
-            $btn.attr('data-quantity', val).data('quantity', val);
-        }
-    });
-
-})(jQuery);
-JS
-    );
-    wp_enqueue_script( $handle );
-}, 999 );
