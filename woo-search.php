@@ -13,6 +13,15 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+if ( ! function_exists( 'woo_search_opt_log' ) ) {
+    function woo_search_opt_log( $msg, $ctx = array() ) {
+        if ( ! empty( $ctx ) ) {
+            $msg .= ' | ' . wp_json_encode( $ctx );
+        }
+        error_log( '[woo-search] ' . $msg );
+    }
+}
+
 // ---- Logger shim (uses existing logger if available) ----
 if ( ! function_exists( 'woo_search_opt_debug' ) ) {
     function woo_search_opt_debug( $msg, $ctx = array() ) {
@@ -2604,6 +2613,17 @@ add_filter( 'woocommerce_loop_add_to_cart_link', function( $html, $product, $arg
         }
     }
 
+    // Gate: OFF by default (prevents duplicate qty when the theme/widget also renders qty).
+    $enable_loop_qty_injection = apply_filters(
+        'woo_search_opt_enable_loop_qty_injection',
+        get_option( 'woo_search_opt_enable_loop_qty_injection', 'no' ) === 'yes'
+    );
+
+    if ( ! $enable_loop_qty_injection ) {
+        // Do not inject our own qty input; let the 3rd-party plugin enhance the theme/widget's qty.
+        return $html;
+    }
+
     $in_catalog = ( function_exists( 'is_product' ) && ! is_product() )
         && ( is_search() || ( function_exists( 'is_shop' ) && is_shop() )
              || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() ) );
@@ -2635,6 +2655,120 @@ add_filter( 'woocommerce_loop_add_to_cart_link', function( $html, $product, $arg
 
     return $out;
 }, 20, 3 );
+
+// Print stock HTML in loop items when Elementor/Woo redraw via AJAX omits it.
+add_action( 'woocommerce_after_shop_loop_item_title', function() {
+    if ( function_exists( 'is_product' ) && is_product() ) {
+        return;
+    }
+
+    $is_catalog = is_search()
+        || ( function_exists( 'is_shop' ) && is_shop() )
+        || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
+
+    if ( ! $is_catalog ) {
+        return;
+    }
+
+    $inject_on_ajax_only = apply_filters( 'woo_search_opt_inject_stock_on_ajax_only', true );
+    $is_ajax             = defined( 'DOING_AJAX' ) && DOING_AJAX;
+
+    if ( $inject_on_ajax_only && ! $is_ajax ) {
+        return;
+    }
+
+    global $product;
+
+    if ( ! $product || ! is_a( $product, 'WC_Product' ) ) {
+        return;
+    }
+
+    $stock_html = wc_get_stock_html( $product );
+
+    if ( empty( $stock_html ) ) {
+        return;
+    }
+
+    echo '<div class="wso-loop-stock">' . $stock_html . '</div>';
+
+    woo_search_opt_log( 'stock:printed_in_loop', array(
+        'product_id' => $product->get_id(),
+        'ajax'       => $is_ajax ? 1 : 0,
+        'context'    => is_search() ? 'search' : ( function_exists( 'is_shop' ) && is_shop() ? 'shop' : 'tax' ),
+    ) );
+}, 22 );
+
+add_filter( 'woocommerce_result_count', function( $html ) {
+    $total        = wc_get_loop_prop( 'total', null );
+    $per_page     = wc_get_loop_prop( 'per_page', null );
+    $current_page = wc_get_loop_prop( 'current_page', null );
+
+    $used_loop_props = ( null !== $total && null !== $per_page && null !== $current_page );
+
+    if ( ! $used_loop_props ) {
+        global $wp_query;
+
+        if ( $wp_query instanceof WP_Query ) {
+            $total        = isset( $wp_query->found_posts ) ? intval( $wp_query->found_posts ) : 0;
+            $per_page     = intval( get_query_var( 'posts_per_page', 0 ) );
+            $current_page = max( 1, intval( get_query_var( 'paged', 1 ) ) );
+        } else {
+            $total = 0;
+            $per_page = 0;
+            $current_page = 1;
+        }
+    }
+
+    $first = 0;
+    $last  = 0;
+
+    if ( $total > 0 && $per_page > 0 ) {
+        $first = ( $per_page * ( $current_page - 1 ) ) + 1;
+        $last  = min( $total, $per_page * $current_page );
+    }
+
+    if ( $last < $first ) {
+        if ( $total > 0 ) {
+            $first = 1;
+            $last  = min( $total, $per_page ? $per_page : $total );
+        } else {
+            $first = 0;
+            $last  = 0;
+        }
+    }
+
+    if ( $per_page <= 0 ) {
+        $per_page = $total;
+    }
+
+    if ( $total <= $per_page ) {
+        $new = sprintf(
+            /* translators: %d: total results */
+            __( 'Showing all %d results', 'woocommerce' ),
+            $total
+        );
+    } else {
+        $new = sprintf(
+            /* translators: 1: first result 2: last result 3: total results */
+            __( 'Showing %1$d–%2$d of %3$d results', 'woocommerce' ),
+            $first,
+            $last,
+            $total
+        );
+    }
+
+    woo_search_opt_log( 'result_count:computed', array(
+        'used_loop_props' => $used_loop_props ? 1 : 0,
+        'total'           => $total,
+        'per_page'        => $per_page,
+        'current_page'    => $current_page,
+        'first'           => $first,
+        'last'            => $last,
+        'is_search'       => is_search() ? 1 : 0,
+    ) );
+
+    return sprintf( '<p class="woocommerce-result-count">%s</p>', esc_html( $new ) );
+}, 10, 1 );
 
 // === Qty buttons: rely on official plugin assets and re-init on redraws ===
 add_action( 'wp_enqueue_scripts', function() {
