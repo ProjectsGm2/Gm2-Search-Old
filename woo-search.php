@@ -2595,9 +2595,49 @@ JS;
 }
 add_action( 'wp_enqueue_scripts', 'woo_search_opt_enqueue_frontend_script' );
 
-// === Qty buttons (final): use the official plugin only; re-init on redraws; TEMP logging ===
+// === Inject a real Woo quantity input into loop items (search/archive) ===
+add_filter( 'woocommerce_loop_add_to_cart_link', function( $html, $product, $args ) {
+    if ( ! function_exists( 'woo_search_opt_log' ) ) {
+        function woo_search_opt_log( $m, $c = array() ) {
+            if ( ! empty( $c ) ) { $m .= ' | ' . wp_json_encode( $c ); }
+            error_log( '[woo-search] ' . $m );
+        }
+    }
+
+    $in_catalog = ( function_exists( 'is_product' ) && ! is_product() )
+        && ( is_search() || ( function_exists( 'is_shop' ) && is_shop() )
+             || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() ) );
+
+    if ( ! $in_catalog ) {
+        return $html;
+    }
+
+    if ( ! $product || ! is_a( $product, 'WC_Product' ) ) { return $html; }
+    if ( ! $product->is_type( 'simple' ) ) { return $html; }
+    if ( ! $product->is_purchasable() ) { return $html; }
+    if ( ! $product->is_in_stock() ) { return $html; }
+    if ( $product->is_sold_individually() ) { return $html; }
+
+    $qty_html = woocommerce_quantity_input( array(
+        'input_value' => 1,
+    ), $product, false );
+
+    if ( empty( $qty_html ) ) {
+        return $html;
+    }
+
+    $out = '<div class="wso-loop-quantity-wrapper">' . $qty_html . '</div>' . $html;
+
+    woo_search_opt_log( 'qty:injected_loop_quantity', array(
+        'product_id' => $product->get_id(),
+        'context'    => is_search() ? 'search' : ( is_shop() ? 'shop' : 'tax' ),
+    ) );
+
+    return $out;
+}, 20, 3 );
+
+// === Qty buttons: rely on official plugin assets and re-init on redraws ===
 add_action( 'wp_enqueue_scripts', function() {
-    // Use the plugin logger if present; otherwise fallback to PHP error_log (safe)
     if ( ! function_exists( 'woo_search_opt_log' ) ) {
         function woo_search_opt_log( $msg, $ctx = array() ) {
             if ( ! empty( $ctx ) ) { $msg .= ' | ' . wp_json_encode( $ctx ); }
@@ -2609,7 +2649,6 @@ add_action( 'wp_enqueue_scripts', function() {
     $is_product_archive = ( function_exists( 'is_post_type_archive' ) && is_post_type_archive( 'product' ) )
                           || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
 
-    // Always log a probe so we can find this in woo-search.log
     woo_search_opt_log( 'qty:enqueue_probe', array(
         'is_search'  => is_search(),
         'post_type'  => get_query_var( 'post_type', '' ),
@@ -2620,7 +2659,6 @@ add_action( 'wp_enqueue_scripts', function() {
         return;
     }
 
-    // TEMP: dump first 25 registered script handles so we can see the real handle name(s)
     global $wp_scripts;
     if ( isset( $wp_scripts->registered ) && is_array( $wp_scripts->registered ) ) {
         $all_handles = array_keys( $wp_scripts->registered );
@@ -2633,18 +2671,15 @@ add_action( 'wp_enqueue_scripts', function() {
         woo_search_opt_log( 'qty:handles_TEMP:no_registered_scripts' );
     }
 
-    // Known handles from wc-quantity-plus-minus-button v2.0.0
-    $qty_script_handles = array( 'wqpmb-script' );            // main frontend JS
-    $qty_style_handles  = array( 'wqpmb-style' );             // CSS (optional but nice to have)
+    $qty_script_handles = array( 'wqpmb-script' );
+    $qty_style_handles  = array( 'wqpmb-style' );
 
-    // Try to enqueue the JS if it's registered but not enqueued yet
     $enqueued_script = null;
     foreach ( $qty_script_handles as $h ) {
         if ( wp_script_is( $h, 'enqueued' ) || wp_script_is( $h, 'to_enqueue' ) ) { $enqueued_script = $h; break; }
         if ( wp_script_is( $h, 'registered' ) ) { wp_enqueue_script( $h ); $enqueued_script = $h; break; }
     }
 
-    // Enqueue the style if available (harmless if the handle doesn't exist)
     $enqueued_style = null;
     foreach ( $qty_style_handles as $hs ) {
         if ( wp_style_is( $hs, 'enqueued' ) || wp_style_is( $hs, 'to_enqueue' ) ) { $enqueued_style = $hs; break; }
@@ -2657,64 +2692,69 @@ add_action( 'wp_enqueue_scripts', function() {
         'style_handle'     => $enqueued_style,
     ) );
 
-    // Minimal, idempotent re-init: work with jQuery or fetch-based redraws.
-    // IMPORTANT: we DO NOT create any buttons; we only trigger the third-party plugin to (re)bind.
-    $handle = 'woo-search-qty-reinit-v2';
+    $handle = 'woo-search-qty-reinit-final';
     wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
     wp_add_inline_script( $handle, <<<JS
 (function($){
     var LOG = '[woo-search][qty] ';
 
-    // Reinit function:
-    // The wc-quantity-plus-minus-button plugin binds on document.ready and jQuery's ajaxComplete.
-    // If the theme uses fetch() (no jQuery ajax), we emit a synthetic ajaxComplete to make it re-bind.
     function wsoQtyReinit(){
+        if (wsoQtyReinit._running) {
+            return;
+        }
+        wsoQtyReinit._running = true;
         try {
             $(document).trigger('ajaxComplete');
             if (window.console && console.debug) { console.debug(LOG + 'reinit'); }
         } catch(e){}
+        wsoQtyReinit._running = false;
     }
 
-    // Full navigation (e.g., page 2 via non-AJAX link)
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', function(){ wsoQtyReinit(); });
     } else {
         wsoQtyReinit();
     }
 
-    // Common Woo/Theme redraw hooks:
     $(document)
       .on('updated_wc_div wc_fragments_refreshed', function(){ wsoQtyReinit(); })
-      .on('ajaxComplete',  function(){ wsoQtyReinit(); })
-      // If your plugin fires this after its own AJAX render:
+      .on('ajaxComplete', function(){ wsoQtyReinit(); })
       .on('gm2_filter_products_done', function(){ wsoQtyReinit(); });
 
-    // MutationObserver to catch non-jQuery redraws (e.g., fetch() or virtual DOM swaps)
     (function observeProducts(){
         var root = document.querySelector('.products') || document.querySelector('.woocommerce');
         if (!root || !window.MutationObserver) return;
         var scheduled = false;
         var mo = new MutationObserver(function(muts){
-            for (var i=0;i<muts.length;i++){
+            for (var i = 0; i < muts.length; i++) {
                 var m = muts[i];
-                if (m.addedNodes && m.addedNodes.length){
-                    // If any new node looks like a product or contains a qty input, reinit once (debounced)
-                    for (var j=0;j<m.addedNodes.length;j++){
+                if (m.addedNodes && m.addedNodes.length) {
+                    for (var j = 0; j < m.addedNodes.length; j++) {
                         var n = m.addedNodes[j];
                         if (!(n instanceof HTMLElement)) continue;
                         if (n.matches && (n.matches('.product') || n.matches('.quantity') || n.matches('input.qty'))) { scheduled = true; break; }
                         if (n.querySelector && (n.querySelector('.product') || n.querySelector('.quantity') || n.querySelector('input.qty'))) { scheduled = true; break; }
                     }
                 }
-                if (scheduled) break;
+                if (scheduled) { break; }
             }
-            if (scheduled){
+            if (scheduled) {
                 scheduled = false;
                 setTimeout(wsoQtyReinit, 0);
             }
         });
-        mo.observe(root, { childList:true, subtree:true });
+        mo.observe(root, { childList: true, subtree: true });
     })();
+
+    $(document).off('click.wsoQtySync', '.add_to_cart_button').on('click.wsoQtySync', '.add_to_cart_button', function(){
+        var $btn = $(this);
+        var $qty = $btn.closest('li.product, .product, .woocommerce').find('.quantity input.qty').first();
+        if ($qty.length) {
+            var val = $qty.val();
+            $btn.attr('data-quantity', val).data('quantity', val);
+        }
+    });
+
 })(jQuery);
 JS
     );
