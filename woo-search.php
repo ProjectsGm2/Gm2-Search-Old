@@ -2595,93 +2595,128 @@ JS;
 }
 add_action( 'wp_enqueue_scripts', 'woo_search_opt_enqueue_frontend_script' );
 
-// === Qty buttons: rely on the official plugin only; re-init around redraws ===
+// === Qty buttons (final): use the official plugin only; re-init on redraws; TEMP logging ===
 add_action( 'wp_enqueue_scripts', function() {
-    // Logger shim: prefer your existing logger if available
-    if ( ! function_exists( 'woo_search_opt_debug' ) ) {
-        function woo_search_opt_debug( $m, $c = array() ) {
-            if ( function_exists( 'woo_search_opt_log' ) ) { woo_search_opt_log( $m, $c ); return; }
-            if ( ! empty( $c ) ) { $m .= ' | ' . wp_json_encode( $c ); }
-            error_log( '[woo-search] ' . $m );
+    // Use the plugin logger if present; otherwise fallback to PHP error_log (safe)
+    if ( ! function_exists( 'woo_search_opt_log' ) ) {
+        function woo_search_opt_log( $msg, $ctx = array() ) {
+            if ( ! empty( $ctx ) ) { $msg .= ' | ' . wp_json_encode( $ctx ); }
+            error_log( '[woo-search] ' . $msg );
         }
     }
 
-    $is_product_search  = is_search() && ( get_query_var('post_type','') === 'product' || 'product' === get_query_var('post_type','') );
-    $is_product_archive = ( function_exists('is_post_type_archive') && is_post_type_archive('product') )
-                          || ( function_exists('is_product_taxonomy') && is_product_taxonomy() );
+    $is_product_search  = is_search() && ( get_query_var( 'post_type', '' ) === 'product' || 'product' === get_query_var( 'post_type', '' ) );
+    $is_product_archive = ( function_exists( 'is_post_type_archive' ) && is_post_type_archive( 'product' ) )
+                          || ( function_exists( 'is_product_taxonomy' ) && is_product_taxonomy() );
+
+    // Always log a probe so we can find this in woo-search.log
+    woo_search_opt_log( 'qty:enqueue_probe', array(
+        'is_search'  => is_search(),
+        'post_type'  => get_query_var( 'post_type', '' ),
+        'is_archive' => $is_product_archive,
+    ) );
 
     if ( ! ( $is_product_search || $is_product_archive ) ) {
         return;
     }
 
-    // TEMP: dump ALL registered script handles to log (to be removed later)
+    // TEMP: dump first 25 registered script handles so we can see the real handle name(s)
     global $wp_scripts;
     if ( isset( $wp_scripts->registered ) && is_array( $wp_scripts->registered ) ) {
         $all_handles = array_keys( $wp_scripts->registered );
-        woo_search_opt_debug( 'qty:dump_registered_script_handles_TEMP', array(
+        woo_search_opt_log( 'qty:handles_TEMP', array(
             'count'   => count( $all_handles ),
-            'handles' => $all_handles,
+            'first25' => array_slice( $all_handles, 0, 25 ),
             'context' => $is_product_search ? 'search' : 'archive',
         ) );
     } else {
-        woo_search_opt_debug( 'qty:no_registered_scripts_found_TEMP' );
+        woo_search_opt_log( 'qty:handles_TEMP:no_registered_scripts' );
     }
 
-    // Enqueue the third-party qty script if it wasn't already enqueued.
-    // Known public handles from the plugin (v2.0.0):
-    //   - 'wqpmb-style' (style)
-    //   - 'wqpmb-script' (frontend behavior)
-    //   - 'wqpmb-ajax-add-to-cart' (archive AJAX add-to-cart, optional)
-    $enqueued_handle = null;
-    foreach ( array( 'wqpmb-script' ) as $h ) {
-        if ( wp_script_is( $h, 'enqueued' ) || wp_script_is( $h, 'to_enqueue' ) ) { $enqueued_handle = $h; break; }
-        if ( wp_script_is( $h, 'registered' ) ) { wp_enqueue_script( $h ); $enqueued_handle = $h; break; }
-    }
-    // Also ensure style if available (harmless if missing)
-    if ( wp_style_is( 'wqpmb-style', 'registered' ) && ! wp_style_is( 'wqpmb-style', 'enqueued' ) ) {
-        wp_enqueue_style( 'wqpmb-style' );
+    // Known handles from wc-quantity-plus-minus-button v2.0.0
+    $qty_script_handles = array( 'wqpmb-script' );            // main frontend JS
+    $qty_style_handles  = array( 'wqpmb-style' );             // CSS (optional but nice to have)
+
+    // Try to enqueue the JS if it's registered but not enqueued yet
+    $enqueued_script = null;
+    foreach ( $qty_script_handles as $h ) {
+        if ( wp_script_is( $h, 'enqueued' ) || wp_script_is( $h, 'to_enqueue' ) ) { $enqueued_script = $h; break; }
+        if ( wp_script_is( $h, 'registered' ) ) { wp_enqueue_script( $h ); $enqueued_script = $h; break; }
     }
 
-    woo_search_opt_debug( 'qty:enqueue', array(
-        'context'         => $is_product_search ? 'search' : 'archive',
-        'enqueued_handle' => $enqueued_handle,
+    // Enqueue the style if available (harmless if the handle doesn't exist)
+    $enqueued_style = null;
+    foreach ( $qty_style_handles as $hs ) {
+        if ( wp_style_is( $hs, 'enqueued' ) || wp_style_is( $hs, 'to_enqueue' ) ) { $enqueued_style = $hs; break; }
+        if ( wp_style_is( $hs, 'registered' ) ) { wp_enqueue_style( $hs ); $enqueued_style = $hs; break; }
+    }
+
+    woo_search_opt_log( 'qty:enqueue_result', array(
+        'context'          => $is_product_search ? 'search' : 'archive',
+        'script_handle'    => $enqueued_script,
+        'style_handle'     => $enqueued_style,
     ) );
 
-    // Minimal, idempotent re-init script: call the plugin's binding after redraws.
-    $handle = 'woo-search-qty-reinit';
+    // Minimal, idempotent re-init: work with jQuery or fetch-based redraws.
+    // IMPORTANT: we DO NOT create any buttons; we only trigger the third-party plugin to (re)bind.
+    $handle = 'woo-search-qty-reinit-v2';
     wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
     wp_add_inline_script( $handle, <<<JS
 (function($){
-    function wsoQtyReinit(ctx){
+    var LOG = '[woo-search][qty] ';
+
+    // Reinit function:
+    // The wc-quantity-plus-minus-button plugin binds on document.ready and jQuery's ajaxComplete.
+    // If the theme uses fetch() (no jQuery ajax), we emit a synthetic ajaxComplete to make it re-bind.
+    function wsoQtyReinit(){
         try {
-            // The qty plugin re-binds on document.ready and jQuery ajaxComplete.
-            // If our flow does not use jQuery AJAX, emulate a global ajaxComplete to trigger its binding.
             $(document).trigger('ajaxComplete');
-            if (window.console && console.debug) { console.debug('[woo-search][qty] reinit'); }
-        } catch (e) {}
+            if (window.console && console.debug) { console.debug(LOG + 'reinit'); }
+        } catch(e){}
     }
 
-    // Full page navigation (covers page 2 via non-AJAX nav)
+    // Full navigation (e.g., page 2 via non-AJAX link)
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function(){ wsoQtyReinit(document); });
+        document.addEventListener('DOMContentLoaded', function(){ wsoQtyReinit(); });
     } else {
-        wsoQtyReinit(document);
+        wsoQtyReinit();
     }
 
-    // Common Woo/Theme/Elementor redraw hooks:
+    // Common Woo/Theme redraw hooks:
     $(document)
-      .on('updated_wc_div', function(){ wsoQtyReinit(document); })
-      .on('ajaxComplete',  function(){ wsoQtyReinit(document); })
-      // If your own search/sort uses custom fetch/XHR, fire this event on success:
-      .on('gm2_filter_products_done', function(){ wsoQtyReinit(document); });
+      .on('updated_wc_div wc_fragments_refreshed', function(){ wsoQtyReinit(); })
+      .on('ajaxComplete',  function(){ wsoQtyReinit(); })
+      // If your plugin fires this after its own AJAX render:
+      .on('gm2_filter_products_done', function(){ wsoQtyReinit(); });
 
+    // MutationObserver to catch non-jQuery redraws (e.g., fetch() or virtual DOM swaps)
+    (function observeProducts(){
+        var root = document.querySelector('.products') || document.querySelector('.woocommerce');
+        if (!root || !window.MutationObserver) return;
+        var scheduled = false;
+        var mo = new MutationObserver(function(muts){
+            for (var i=0;i<muts.length;i++){
+                var m = muts[i];
+                if (m.addedNodes && m.addedNodes.length){
+                    // If any new node looks like a product or contains a qty input, reinit once (debounced)
+                    for (var j=0;j<m.addedNodes.length;j++){
+                        var n = m.addedNodes[j];
+                        if (!(n instanceof HTMLElement)) continue;
+                        if (n.matches && (n.matches('.product') || n.matches('.quantity') || n.matches('input.qty'))) { scheduled = true; break; }
+                        if (n.querySelector && (n.querySelector('.product') || n.querySelector('.quantity') || n.querySelector('input.qty'))) { scheduled = true; break; }
+                    }
+                }
+                if (scheduled) break;
+            }
+            if (scheduled){
+                scheduled = false;
+                setTimeout(wsoQtyReinit, 0);
+            }
+        });
+        mo.observe(root, { childList:true, subtree:true });
+    })();
 })(jQuery);
 JS
     );
     wp_enqueue_script( $handle );
-
-    woo_search_opt_debug( 'qty:inline_reinit_added', array(
-        'search'  => $is_product_search,
-        'archive' => $is_product_archive
-    ) );
 }, 999 );
