@@ -2818,7 +2818,7 @@ add_action( 'wp_enqueue_scripts', function() {
         return;
     }
     wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
-    wp_add_inline_script( $handle, <<<JS
+    wp_add_inline_script( $handle, <<<'JS'
 jQuery(document).off('click.wsoQtySync','.add_to_cart_button').on('click.wsoQtySync','.add_to_cart_button',function(){
     var $btn=jQuery(this), $qty=$btn.closest('li.product, .product, .woocommerce').find('.quantity input.qty').first();
     if($qty.length){ var v=$qty.val(); $btn.attr('data-quantity',v).data('quantity',v); }
