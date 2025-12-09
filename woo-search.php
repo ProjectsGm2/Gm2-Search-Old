@@ -551,6 +551,51 @@ function woo_search_opt_find_search_term_in_payload( $payload, array $keys, $dep
 }
 
 /**
+ * Normalize incoming search input by mapping typographic quotes to ASCII equivalents
+ * and collapsing whitespace.
+ *
+ * @param mixed $value Raw search input.
+ *
+ * @return string Normalized search phrase or empty string when no usable content exists.
+ */
+function woo_search_opt_normalize_search_input( $value ) {
+    if ( is_scalar( $value ) ) {
+        $value = (string) $value;
+    } else {
+        return '';
+    }
+
+    $value = sanitize_text_field( wp_unslash( $value ) );
+    $value = trim( $value );
+
+    if ( '' === $value ) {
+        return '';
+    }
+
+    $quote_map = array(
+        '“' => '"',
+        '”' => '"',
+        '„' => '"',
+        '‟' => '"',
+        '″' => '"',
+        '＂' => '"',
+        '❝' => '"',
+        '❞' => '"',
+        '’' => "'",
+        '‘' => "'",
+        '‚' => "'",
+        '‛' => "'",
+        '′' => "'",
+        '＇' => "'",
+    );
+
+    $normalized = strtr( $value, $quote_map );
+    $normalized = preg_replace( '/\s+/u', ' ', $normalized );
+
+    return trim( $normalized );
+}
+
+/**
  * Resolve the active search phrase for the current query or request context.
  *
  * @param WP_Query|null $wp_query Optional query instance to inspect.
@@ -562,7 +607,7 @@ function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
         $search_term = $wp_query->get( 's' );
 
         if ( is_string( $search_term ) ) {
-            $search_term = trim( $search_term );
+            $search_term = woo_search_opt_normalize_search_input( $search_term );
 
             if ( '' !== $search_term ) {
                 return $search_term;
@@ -583,8 +628,7 @@ function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
             continue;
         }
 
-        $value = sanitize_text_field( wp_unslash( $value ) );
-        $value = trim( $value );
+        $value = woo_search_opt_normalize_search_input( $value );
 
         if ( '' !== $value ) {
             return $value;
@@ -605,6 +649,10 @@ function woo_search_opt_resolve_search_phrase( $wp_query = null ) {
         }
 
         $value = woo_search_opt_find_search_term_in_payload( $payload, $request_keys );
+
+        if ( '' !== $value ) {
+            $value = woo_search_opt_normalize_search_input( $value );
+        }
 
         if ( '' !== $value ) {
             return $value;
