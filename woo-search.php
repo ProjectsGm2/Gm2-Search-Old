@@ -16,6 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 // --- Robust file logger to uploads/woo-search.log ---
 if ( ! function_exists( 'wso_log' ) ) {
     function wso_log( $msg, $ctx = array() ) {
+        if ( ! defined( 'WOO_SEARCH_OPT_DEBUG' ) || ! WOO_SEARCH_OPT_DEBUG ) {
+            return;
+        }
+
         $prefix = '[woo-search] ';
         if ( ! empty( $ctx ) ) {
             $msg .= ' | ' . wp_json_encode( $ctx );
@@ -2814,7 +2818,7 @@ add_action( 'wp_enqueue_scripts', function() {
         return;
     }
     wp_register_script( $handle, false, array( 'jquery' ), '1.0', true );
-    wp_add_inline_script( $handle, <<<JS
+    wp_add_inline_script( $handle, <<<'JS'
 jQuery(document).off('click.wsoQtySync','.add_to_cart_button').on('click.wsoQtySync','.add_to_cart_button',function(){
     var $btn=jQuery(this), $qty=$btn.closest('li.product, .product, .woocommerce').find('.quantity input.qty').first();
     if($qty.length){ var v=$qty.val(); $btn.attr('data-quantity',v).data('quantity',v); }
