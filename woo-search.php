@@ -16,6 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 // --- Robust file logger to uploads/woo-search.log ---
 if ( ! function_exists( 'wso_log' ) ) {
     function wso_log( $msg, $ctx = array() ) {
+        if ( ! defined( 'WOO_SEARCH_OPT_DEBUG' ) || ! WOO_SEARCH_OPT_DEBUG ) {
+            return;
+        }
+
         $prefix = '[woo-search] ';
         if ( ! empty( $ctx ) ) {
             $msg .= ' | ' . wp_json_encode( $ctx );
